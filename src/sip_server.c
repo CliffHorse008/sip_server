@@ -25,6 +25,7 @@
 typedef struct {
     char method[16];
     char via[1024];
+    char via_branch[256];
     char from[1024];
     char to[1024];
     char call_id[256];
@@ -199,6 +200,49 @@ static int get_header_value(const char *message, const char *header_name, char *
     return 0;
 }
 
+static void extract_header_param_value(const char *header_value,
+                                       const char *param_name,
+                                       char *buffer,
+                                       size_t buffer_size)
+{
+    const char *cursor = header_value;
+    size_t param_name_len = strlen(param_name);
+
+    if (buffer_size == 0) {
+        return;
+    }
+
+    buffer[0] = '\0';
+    if (header_value == NULL || param_name == NULL) {
+        return;
+    }
+
+    while (*cursor != '\0') {
+        while (*cursor != '\0' && *cursor != ';') {
+            ++cursor;
+        }
+        if (*cursor != ';') {
+            return;
+        }
+
+        ++cursor;
+        while (*cursor != '\0' && isspace((unsigned char) *cursor)) {
+            ++cursor;
+        }
+
+        if (str_case_prefix(cursor, param_name, param_name_len) && cursor[param_name_len] == '=') {
+            const char *value = cursor + param_name_len + 1;
+            const char *end = value;
+
+            while (*end != '\0' && *end != ';' && *end != ',' && !isspace((unsigned char) *end)) {
+                ++end;
+            }
+            trim_copy(buffer, buffer_size, value, (size_t) (end - value));
+            return;
+        }
+    }
+}
+
 static const char *get_body(const char *message)
 {
     const char *separator = strstr(message, "\r\n\r\n");
@@ -232,6 +276,7 @@ static int parse_request(const char *message, const struct sockaddr_in *peer, si
         !get_header_value(message, "Call-ID", request->call_id, sizeof(request->call_id))) {
         return -1;
     }
+    extract_header_param_value(request->via, "branch", request->via_branch, sizeof(request->via_branch));
 
     if (get_header_value(message, "CSeq", first_line, sizeof(first_line))) {
         sscanf(first_line, "%d %15s", &request->cseq, request->cseq_method);
@@ -251,6 +296,28 @@ static void build_to_header(const char *original_to, const char *local_tag, char
     snprintf(buffer, buffer_size, "%s;tag=%s", original_to, local_tag);
 }
 
+static void build_via_header(const sip_request_t *request, char *buffer, size_t buffer_size)
+{
+    char temp[1100];
+    char *rport_marker;
+
+    snprintf(buffer, buffer_size, "%s", request->via);
+
+    rport_marker = strstr(buffer, ";rport");
+    if (rport_marker != NULL && strncmp(rport_marker, ";rport=", 7) != 0) {
+        const char *suffix = rport_marker + 6;
+
+        *rport_marker = '\0';
+        snprintf(temp, sizeof(temp), "%s;rport=%u%s", buffer, request->source_port, suffix);
+        snprintf(buffer, buffer_size, "%s", temp);
+    }
+
+    if (request->source_ip[0] != '\0' && strstr(buffer, ";received=") == NULL) {
+        snprintf(temp, sizeof(temp), "%s;received=%s", buffer, request->source_ip);
+        snprintf(buffer, buffer_size, "%s", temp);
+    }
+}
+
 static int send_response(int sock,
                          const struct sockaddr_in *peer,
                          const sip_request_t *request,
@@ -263,10 +330,12 @@ static int send_response(int sock,
 {
     char packet[SIP_BUFFER_SIZE];
     char to_header[1100];
+    char via_header[1100];
     size_t body_length = body == NULL ? 0U : strlen(body);
     int written;
 
     build_to_header(request->to, local_tag, to_header, sizeof(to_header));
+    build_via_header(request, via_header, sizeof(via_header));
 
     written = snprintf(packet,
                        sizeof(packet),
@@ -285,7 +354,7 @@ static int send_response(int sock,
                        "%s",
                        status_code,
                        reason_phrase,
-                       request->via,
+                       via_header,
                        request->from,
                        to_header,
                        request->call_id,
@@ -815,6 +884,13 @@ static void invite_transaction_reset(invite_transaction_t *transaction)
 
 static int invite_transaction_matches(const invite_transaction_t *transaction, const sip_request_t *request)
 {
+    if (transaction->request.via_branch[0] != '\0' && request->via_branch[0] != '\0') {
+        return transaction->active &&
+               strcmp(transaction->request.call_id, request->call_id) == 0 &&
+               transaction->request.cseq == request->cseq &&
+               strcmp(transaction->request.via_branch, request->via_branch) == 0;
+    }
+
     return transaction->active &&
            strcmp(transaction->request.call_id, request->call_id) == 0 &&
            transaction->request.cseq == request->cseq &&
@@ -937,6 +1013,35 @@ static void emit_signal_event(const sip_server_handlers_t *handlers,
     handlers->on_signal(&event, handlers->user_data);
 }
 
+static int send_response_maybe_emit(int sock,
+                                    const struct sockaddr_in *peer,
+                                    const sip_request_t *request,
+                                    int status_code,
+                                    const char *reason_phrase,
+                                    const char *local_tag,
+                                    const app_config_t *config,
+                                    const char *extra_headers,
+                                    const char *body,
+                                    const sip_server_handlers_t *handlers,
+                                    streamer_t *streamer,
+                                    int emit_response_signal)
+{
+    int rc = send_response(sock, peer, request, status_code, reason_phrase, local_tag, config, extra_headers, body);
+
+    if (rc == 0 && emit_response_signal) {
+        emit_signal_event(handlers,
+                          streamer,
+                          SIP_SIGNAL_RESPONSE_SENT,
+                          request,
+                          NULL,
+                          status_code,
+                          reason_phrase,
+                          body);
+    }
+
+    return rc;
+}
+
 static int send_response_and_emit(int sock,
                                   const struct sockaddr_in *peer,
                                   const sip_request_t *request,
@@ -949,20 +1054,18 @@ static int send_response_and_emit(int sock,
                                   const sip_server_handlers_t *handlers,
                                   streamer_t *streamer)
 {
-    int rc = send_response(sock, peer, request, status_code, reason_phrase, local_tag, config, extra_headers, body);
-
-    if (rc == 0) {
-        emit_signal_event(handlers,
-                          streamer,
-                          SIP_SIGNAL_RESPONSE_SENT,
-                          request,
-                          NULL,
-                          status_code,
-                          reason_phrase,
-                          body);
-    }
-
-    return rc;
+    return send_response_maybe_emit(sock,
+                                    peer,
+                                    request,
+                                    status_code,
+                                    reason_phrase,
+                                    local_tag,
+                                    config,
+                                    extra_headers,
+                                    body,
+                                    handlers,
+                                    streamer,
+                                    1);
 }
 
 static void invite_transaction_store(invite_transaction_t *transaction,
@@ -1297,13 +1400,23 @@ int sip_server_run_with_handlers(const app_config_t *config,
 
         {
             sip_request_t request;
+            terminated_dialog_t *matched_terminated_bye = NULL;
+            int duplicate_bye_after_termination = 0;
 
             if (parse_request(buffer, &peer, &request) != 0) {
                 fprintf(stderr, "ignoring malformed SIP message\n");
                 continue;
             }
 
-            fprintf(stdout, "SIP %s from %s:%u\n", request.method, request.source_ip, request.source_port);
+            if (str_case_equal(request.method, "BYE") && !dialog_matches(&dialog, &request)) {
+                matched_terminated_bye =
+                    terminated_dialog_find_match(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &request);
+                duplicate_bye_after_termination = matched_terminated_bye != NULL;
+            }
+
+            if (!duplicate_bye_after_termination) {
+                fprintf(stdout, "SIP %s from %s:%u\n", request.method, request.source_ip, request.source_port);
+            }
 
             if (str_case_equal(request.method, "INVITE")) {
                 invite_transaction_t *matched_invite =
@@ -1334,8 +1447,6 @@ int sip_server_run_with_handlers(const app_config_t *config,
                 emit_signal_event(handlers, streamer, SIP_SIGNAL_INVITE_RECEIVED, &request, NULL, 0, NULL, request.body);
             } else if (str_case_equal(request.method, "ACK")) {
                 emit_signal_event(handlers, streamer, SIP_SIGNAL_ACK_RECEIVED, &request, NULL, 0, NULL, request.body);
-            } else if (str_case_equal(request.method, "BYE")) {
-                emit_signal_event(handlers, streamer, SIP_SIGNAL_BYE_RECEIVED, &request, NULL, 0, NULL, request.body);
             } else if (str_case_equal(request.method, "OPTIONS")) {
                 emit_signal_event(handlers, streamer, SIP_SIGNAL_OPTIONS_RECEIVED, &request, NULL, 0, NULL, request.body);
             } else if (str_case_equal(request.method, "REGISTER")) {
@@ -1397,10 +1508,10 @@ int sip_server_run_with_handlers(const app_config_t *config,
 
                 streamer_stop(streamer);
                 if (dialog.active) {
+                    terminated_dialog_store(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &dialog);
                     emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, NULL, &dialog, 0, NULL, NULL);
                 }
                 dialog_reset(&dialog);
-                memset(terminated_dialogs, 0, sizeof(terminated_dialogs));
                 memset(invite_transactions, 0, sizeof(invite_transactions));
                 generate_local_tag(dialog.local_tag, sizeof(dialog.local_tag));
 
@@ -1581,6 +1692,7 @@ int sip_server_run_with_handlers(const app_config_t *config,
                 }
             } else if (str_case_equal(request.method, "BYE")) {
                 if (dialog_matches(&dialog, &request)) {
+                    emit_signal_event(handlers, streamer, SIP_SIGNAL_BYE_RECEIVED, &request, NULL, 0, NULL, request.body);
                     streamer_stop(streamer);
                     send_response_and_emit(sip_socket,
                                            &peer,
@@ -1597,35 +1709,39 @@ int sip_server_run_with_handlers(const app_config_t *config,
                     emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, &request, &dialog, 0, NULL, NULL);
                     dialog_reset(&dialog);
                 } else {
-                    terminated_dialog_t *matched_terminated =
-                        terminated_dialog_find_match(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &request);
+                    if (matched_terminated_bye == NULL) {
+                        matched_terminated_bye =
+                            terminated_dialog_find_match(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &request);
+                    }
 
-                    if (matched_terminated != NULL) {
-                    send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           200,
-                                           "OK",
-                                           matched_terminated->local_tag,
-                                           config,
-                                           NULL,
-                                           NULL,
-                                           handlers,
-                                           streamer);
+                    if (matched_terminated_bye != NULL) {
+                        send_response_maybe_emit(sip_socket,
+                                                 &peer,
+                                                 &request,
+                                                 200,
+                                                 "OK",
+                                                 matched_terminated_bye->local_tag,
+                                                 config,
+                                                 NULL,
+                                                 NULL,
+                                                 handlers,
+                                                 streamer,
+                                                 0);
                     } else {
-                    char local_tag[32];
-                    generate_local_tag(local_tag, sizeof(local_tag));
-                    send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           481,
-                                           "Call/Transaction Does Not Exist",
-                                           local_tag,
-                                           config,
-                                           NULL,
-                                           NULL,
-                                           handlers,
-                                           streamer);
+                        char local_tag[32];
+
+                        generate_local_tag(local_tag, sizeof(local_tag));
+                        send_response_and_emit(sip_socket,
+                                               &peer,
+                                               &request,
+                                               481,
+                                               "Call/Transaction Does Not Exist",
+                                               local_tag,
+                                               config,
+                                               NULL,
+                                               NULL,
+                                               handlers,
+                                               streamer);
                     }
                 }
             } else {
