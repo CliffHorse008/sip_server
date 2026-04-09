@@ -18,6 +18,7 @@
 #define RTP_MAX_PAYLOAD 1200
 #define RTP_CLOCK_VIDEO 90000U
 #define G711A_PACKET_SAMPLES 160U
+#define STREAMER_QUEUE_DEPTH 128
 
 typedef struct {
     const unsigned char *data;
@@ -86,14 +87,11 @@ struct streamer {
     int video_socket_fd;
     receive_thread_args_t audio_receive_args;
     receive_thread_args_t video_receive_args;
-    char remote_ip[64];
-    char remote_ip_alt[64];
-    uint16_t remote_audio_port;
-    uint16_t remote_video_port;
-    uint8_t remote_audio_payload_type;
-    uint8_t remote_video_payload_type;
+    streamer_session_params_t session;
     streamer_receive_callback_t receive_callback;
     void *receive_user_data;
+    struct media_frame_queue *audio_queue_ptr;
+    struct media_frame_queue *video_queue_ptr;
 };
 
 typedef struct {
@@ -105,6 +103,23 @@ typedef struct {
     uint32_t timestamp;
     uint32_t ssrc;
 } rtp_context_t;
+
+typedef struct media_frame {
+    unsigned char *data;
+    size_t size;
+    uint32_t timestamp;
+    struct media_frame *next;
+} media_frame_t;
+
+typedef struct media_frame_queue {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    media_frame_t *head;
+    media_frame_t *tail;
+    size_t depth;
+    size_t max_depth;
+    int stopped;
+} media_frame_queue_t;
 
 void streamer_stop(streamer_t *streamer);
 
@@ -530,6 +545,163 @@ static int load_assets(media_assets_t *assets, const app_config_t *config)
     return 0;
 }
 
+static media_frame_queue_t *media_queue_create(size_t max_depth)
+{
+    media_frame_queue_t *queue = (media_frame_queue_t *) calloc(1, sizeof(*queue));
+
+    if (queue == NULL) {
+        return NULL;
+    }
+
+    pthread_mutex_init(&queue->mutex, NULL);
+    pthread_cond_init(&queue->cond, NULL);
+    queue->max_depth = max_depth;
+    return queue;
+}
+
+static void media_queue_wake_and_stop(media_frame_queue_t *queue)
+{
+    pthread_mutex_lock(&queue->mutex);
+    queue->stopped = 1;
+    pthread_cond_broadcast(&queue->cond);
+    pthread_mutex_unlock(&queue->mutex);
+}
+
+static void media_queue_reset(media_frame_queue_t *queue)
+{
+    media_frame_t *node;
+    media_frame_t *next;
+
+    pthread_mutex_lock(&queue->mutex);
+    queue->stopped = 0;
+    node = queue->head;
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->depth = 0;
+    pthread_mutex_unlock(&queue->mutex);
+
+    while (node != NULL) {
+        next = node->next;
+        free(node->data);
+        free(node);
+        node = next;
+    }
+}
+
+static void media_queue_destroy(media_frame_queue_t *queue)
+{
+    if (queue == NULL) {
+        return;
+    }
+
+    media_queue_wake_and_stop(queue);
+    media_queue_reset(queue);
+    pthread_cond_destroy(&queue->cond);
+    pthread_mutex_destroy(&queue->mutex);
+    free(queue);
+}
+
+static int media_queue_push(media_frame_queue_t *queue, const uint8_t *data, size_t size, uint32_t timestamp)
+{
+    media_frame_t *node;
+
+    if (queue == NULL || data == NULL || size == 0) {
+        return -1;
+    }
+
+    node = (media_frame_t *) calloc(1, sizeof(*node));
+    if (node == NULL) {
+        return -1;
+    }
+    node->data = (unsigned char *) malloc(size);
+    if (node->data == NULL) {
+        free(node);
+        return -1;
+    }
+
+    memcpy(node->data, data, size);
+    node->size = size;
+    node->timestamp = timestamp;
+
+    pthread_mutex_lock(&queue->mutex);
+    if (queue->stopped) {
+        pthread_mutex_unlock(&queue->mutex);
+        free(node->data);
+        free(node);
+        return -1;
+    }
+
+    if (queue->depth >= queue->max_depth && queue->head != NULL) {
+        media_frame_t *dropped = queue->head;
+
+        queue->head = dropped->next;
+        if (queue->head == NULL) {
+            queue->tail = NULL;
+        }
+        --queue->depth;
+        free(dropped->data);
+        free(dropped);
+    }
+
+    if (queue->tail == NULL) {
+        queue->head = node;
+        queue->tail = node;
+    } else {
+        queue->tail->next = node;
+        queue->tail = node;
+    }
+    ++queue->depth;
+    pthread_cond_signal(&queue->cond);
+    pthread_mutex_unlock(&queue->mutex);
+    return 0;
+}
+
+static int media_queue_pop(media_frame_queue_t *queue, media_frame_t *frame, int wait_ms)
+{
+    int rc = 0;
+
+    memset(frame, 0, sizeof(*frame));
+    pthread_mutex_lock(&queue->mutex);
+    while (queue->head == NULL && !queue->stopped) {
+        if (wait_ms <= 0) {
+            pthread_mutex_unlock(&queue->mutex);
+            return 0;
+        }
+
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += wait_ms / 1000;
+            ts.tv_nsec += (long) (wait_ms % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            rc = pthread_cond_timedwait(&queue->cond, &queue->mutex, &ts);
+        }
+
+        if (rc != 0) {
+            pthread_mutex_unlock(&queue->mutex);
+            return 0;
+        }
+    }
+
+    if (queue->stopped || queue->head == NULL) {
+        pthread_mutex_unlock(&queue->mutex);
+        return 0;
+    }
+
+    *frame = *queue->head;
+    queue->head = frame->next;
+    if (queue->head == NULL) {
+        queue->tail = NULL;
+    }
+    frame->next = NULL;
+    --queue->depth;
+    pthread_mutex_unlock(&queue->mutex);
+    return 1;
+}
+
 void streamer_set_receive_callback(streamer_t *streamer,
                                    streamer_receive_callback_t callback,
                                    void *user_data)
@@ -540,6 +712,24 @@ void streamer_set_receive_callback(streamer_t *streamer,
 
     streamer->receive_callback = callback;
     streamer->receive_user_data = user_data;
+}
+
+int streamer_push_audio_frame(streamer_t *streamer, const streamer_audio_frame_t *frame)
+{
+    if (streamer == NULL || frame == NULL) {
+        return -1;
+    }
+
+    return media_queue_push(streamer->audio_queue_ptr, frame->data, frame->size, frame->timestamp);
+}
+
+int streamer_push_video_frame(streamer_t *streamer, const streamer_video_frame_t *frame)
+{
+    if (streamer == NULL || frame == NULL) {
+        return -1;
+    }
+
+    return media_queue_push(streamer->video_queue_ptr, frame->data, frame->size, frame->timestamp);
 }
 
 static int rtp_send_packet(rtp_context_t *context,
@@ -641,6 +831,55 @@ static int rtp_send_h264_nal(rtp_context_t *context,
     return 0;
 }
 
+static int rtp_send_h264_access_unit(rtp_context_t *context,
+                                     uint8_t payload_type,
+                                     const unsigned char *data,
+                                     size_t size)
+{
+    size_t offset = 0;
+    size_t start;
+    size_t prefix_len;
+    int sent = 0;
+
+    if (find_start_code(data, size, 0, &start, &prefix_len)) {
+        while (1) {
+            size_t nal_offset = start + prefix_len;
+            size_t next_start;
+            size_t next_prefix_len;
+            size_t nal_end;
+            int has_next;
+
+            has_next = find_start_code(data, size, nal_offset, &next_start, &next_prefix_len);
+            nal_end = has_next ? next_start : size;
+            while (nal_end > nal_offset && data[nal_end - 1] == 0x00) {
+                --nal_end;
+            }
+
+            if (nal_end > nal_offset) {
+                int marker = !has_next;
+
+                if (rtp_send_h264_nal(context, payload_type, data + nal_offset, nal_end - nal_offset, marker) != 0) {
+                    return -1;
+                }
+                sent = 1;
+            }
+
+            if (!has_next) {
+                break;
+            }
+
+            offset = next_start;
+            start = next_start;
+            prefix_len = next_prefix_len;
+            (void) offset;
+        }
+
+        return sent ? 0 : -1;
+    }
+
+    return rtp_send_h264_nal(context, payload_type, data, size, 1);
+}
+
 static int rtp_send_aac_frame(rtp_context_t *context,
                               uint8_t payload_type,
                               const unsigned char *frame,
@@ -667,6 +906,12 @@ static int rtp_send_g711a_frame(rtp_context_t *context,
                                 size_t frame_length)
 {
     return rtp_send_packet(context, payload_type, 1, frame, frame_length);
+}
+
+static void media_frame_release(media_frame_t *frame)
+{
+    free(frame->data);
+    memset(frame, 0, sizeof(*frame));
 }
 
 static int create_rtp_context(const app_config_t *config,
@@ -812,9 +1057,9 @@ static void *video_thread_main(void *opaque)
     if (create_rtp_context(streamer->config,
                            streamer->video_socket_fd,
                            streamer->config->video_port,
-                           streamer->remote_ip,
-                           streamer->remote_ip_alt,
-                           streamer->remote_video_port,
+                           streamer->session.remote_ip,
+                           streamer->session.remote_ip_alt,
+                           streamer->session.video_port,
                            random_u32(),
                            &context) != 0) {
         return NULL;
@@ -823,20 +1068,45 @@ static void *video_thread_main(void *opaque)
     fprintf(stdout,
             "video RTP start local=%u remote=%s%s%s:%u pt=%u\n",
             streamer->config->video_port,
-            streamer->remote_ip,
-            streamer->remote_ip_alt[0] != '\0' ? " alt=" : "",
-            streamer->remote_ip_alt[0] != '\0' ? streamer->remote_ip_alt : "",
-            streamer->remote_video_port,
-            streamer->remote_video_payload_type);
+            streamer->session.remote_ip,
+            streamer->session.remote_ip_alt[0] != '\0' ? " alt=" : "",
+            streamer->session.remote_ip_alt[0] != '\0' ? streamer->session.remote_ip_alt : "",
+            streamer->session.video_port,
+            streamer->session.video_payload_type);
 
-        while (!streamer->stop_requested) {
+    while (!streamer->stop_requested) {
+        media_frame_t frame;
+
+        if (media_queue_pop(streamer->video_queue_ptr, &frame, 10)) {
+            context.timestamp = frame.timestamp;
+            if (rtp_send_h264_access_unit(&context,
+                                          streamer->session.video_payload_type,
+                                          frame.data,
+                                          frame.size) != 0) {
+                perror("sendto(video-live)");
+                media_frame_release(&frame);
+                break;
+            }
+            media_frame_release(&frame);
+            continue;
+        }
+
+        if (streamer->session.live_input_only) {
+            continue;
+        }
+
+        if (!streamer->assets.h264.enabled) {
+            continue;
+        }
+
+        {
             const h264_nal_t *nal = &streamer->assets.h264.nals[index];
             int is_last_nal_of_au =
                 (index + 1 >= streamer->assets.h264.nal_count) ||
                 (streamer->assets.h264.nals[index + 1].nal_type == 9);
 
             if (rtp_send_h264_nal(&context,
-                                  streamer->remote_video_payload_type,
+                                  streamer->session.video_payload_type,
                                   nal->data,
                                   nal->length,
                                   is_last_nal_of_au && nal->nal_type != 9) != 0) {
@@ -844,14 +1114,15 @@ static void *video_thread_main(void *opaque)
                 break;
             }
 
-        if (is_last_nal_of_au && nal->nal_type != 9) {
-            sleep_ns(frame_interval_ns);
-            context.timestamp += frame_step;
-        }
+            if (is_last_nal_of_au && nal->nal_type != 9) {
+                sleep_ns(frame_interval_ns);
+                context.timestamp += frame_step;
+            }
 
-        ++index;
-        if (index >= streamer->assets.h264.nal_count) {
-            index = 0;
+            ++index;
+            if (index >= streamer->assets.h264.nal_count) {
+                index = 0;
+            }
         }
     }
 
@@ -867,9 +1138,9 @@ static void *audio_thread_main(void *opaque)
     if (create_rtp_context(streamer->config,
                            streamer->audio_socket_fd,
                            streamer->config->audio_port,
-                           streamer->remote_ip,
-                           streamer->remote_ip_alt,
-                           streamer->remote_audio_port,
+                           streamer->session.remote_ip,
+                           streamer->session.remote_ip_alt,
+                           streamer->session.audio_port,
                            random_u32(),
                            &context) != 0) {
         return NULL;
@@ -878,33 +1149,58 @@ static void *audio_thread_main(void *opaque)
     fprintf(stdout,
             "audio RTP start local=%u remote=%s%s%s:%u pt=%u codec=%s\n",
             streamer->config->audio_port,
-            streamer->remote_ip,
-            streamer->remote_ip_alt[0] != '\0' ? " alt=" : "",
-            streamer->remote_ip_alt[0] != '\0' ? streamer->remote_ip_alt : "",
-            streamer->remote_audio_port,
-            streamer->remote_audio_payload_type,
-            config_audio_codec_name(streamer->config->audio_codec));
+            streamer->session.remote_ip,
+            streamer->session.remote_ip_alt[0] != '\0' ? " alt=" : "",
+            streamer->session.remote_ip_alt[0] != '\0' ? streamer->session.remote_ip_alt : "",
+            streamer->session.audio_port,
+            streamer->session.audio_payload_type,
+            config_audio_codec_name(streamer->session.audio_codec));
 
-    if (streamer->config->audio_codec == AUDIO_CODEC_AAC) {
+    if (streamer->session.audio_codec == AUDIO_CODEC_AAC) {
         long long interval_ns;
         size_t index = 0;
 
         interval_ns = (long long) (1024.0 * 1000000000.0 / streamer->assets.aac.sample_rate);
 
         while (!streamer->stop_requested) {
-            const aac_frame_t *frame = &streamer->assets.aac.frames[index];
+            media_frame_t frame;
 
-            if (rtp_send_aac_frame(&context,
-                                   streamer->remote_audio_payload_type,
-                                   frame->data,
-                                   frame->length) != 0) {
-                perror("sendto(audio-aac)");
-                break;
+            if (media_queue_pop(streamer->audio_queue_ptr, &frame, 10)) {
+                context.timestamp = frame.timestamp;
+                if (rtp_send_aac_frame(&context,
+                                       streamer->session.audio_payload_type,
+                                       frame.data,
+                                       frame.size) != 0) {
+                    perror("sendto(audio-aac-live)");
+                    media_frame_release(&frame);
+                    break;
+                }
+                media_frame_release(&frame);
+                continue;
+            }
+
+            if (streamer->session.live_input_only) {
+                continue;
+            }
+
+            if (!streamer->assets.aac.enabled) {
+                continue;
+            }
+
+            {
+                const aac_frame_t *asset_frame = &streamer->assets.aac.frames[index];
+
+                if (rtp_send_aac_frame(&context,
+                                       streamer->session.audio_payload_type,
+                                       asset_frame->data,
+                                       asset_frame->length) != 0) {
+                    perror("sendto(audio-aac)");
+                    break;
+                }
             }
 
             sleep_ns(interval_ns);
             context.timestamp += 1024;
-
             ++index;
             if (index >= streamer->assets.aac.frame_count) {
                 index = 0;
@@ -914,28 +1210,54 @@ static void *audio_thread_main(void *opaque)
         size_t offset = 0;
 
         while (!streamer->stop_requested) {
-            size_t remaining = streamer->assets.g711a.blob_size - offset;
-            size_t chunk = remaining >= G711A_PACKET_SAMPLES ? G711A_PACKET_SAMPLES : remaining;
+            media_frame_t frame;
 
-            if (chunk == 0) {
-                offset = 0;
+            if (media_queue_pop(streamer->audio_queue_ptr, &frame, 10)) {
+                context.timestamp = frame.timestamp;
+                if (rtp_send_g711a_frame(&context,
+                                         streamer->session.audio_payload_type,
+                                         frame.data,
+                                         frame.size) != 0) {
+                    perror("sendto(audio-g711a-live)");
+                    media_frame_release(&frame);
+                    break;
+                }
+                media_frame_release(&frame);
                 continue;
             }
 
-            if (rtp_send_g711a_frame(&context,
-                                     streamer->remote_audio_payload_type,
-                                     streamer->assets.g711a.blob + offset,
-                                     chunk) != 0) {
-                perror("sendto(audio-g711a)");
-                break;
+            if (streamer->session.live_input_only) {
+                continue;
             }
 
-            sleep_ns(20000000LL);
-            context.timestamp += (uint32_t) chunk;
+            if (!streamer->assets.g711a.enabled) {
+                continue;
+            }
 
-            offset += chunk;
-            if (offset >= streamer->assets.g711a.blob_size) {
-                offset = 0;
+            {
+                size_t remaining = streamer->assets.g711a.blob_size - offset;
+                size_t chunk = remaining >= G711A_PACKET_SAMPLES ? G711A_PACKET_SAMPLES : remaining;
+
+                if (chunk == 0) {
+                    offset = 0;
+                    continue;
+                }
+
+                if (rtp_send_g711a_frame(&context,
+                                         streamer->session.audio_payload_type,
+                                         streamer->assets.g711a.blob + offset,
+                                         chunk) != 0) {
+                    perror("sendto(audio-g711a)");
+                    break;
+                }
+
+                sleep_ns(20000000LL);
+                context.timestamp += (uint32_t) chunk;
+
+                offset += chunk;
+                if (offset >= streamer->assets.g711a.blob_size) {
+                    offset = 0;
+                }
             }
         }
     }
@@ -955,9 +1277,16 @@ streamer_t *streamer_create(const app_config_t *config)
     streamer->config = config;
     streamer->audio_socket_fd = -1;
     streamer->video_socket_fd = -1;
-    if (load_assets(&streamer->assets, config) != 0) {
+    streamer->audio_queue_ptr = media_queue_create(STREAMER_QUEUE_DEPTH);
+    streamer->video_queue_ptr = media_queue_create(STREAMER_QUEUE_DEPTH);
+    if (streamer->audio_queue_ptr == NULL || streamer->video_queue_ptr == NULL) {
+        media_queue_destroy(streamer->audio_queue_ptr);
+        media_queue_destroy(streamer->video_queue_ptr);
         free(streamer);
         return NULL;
+    }
+    if (load_assets(&streamer->assets, config) != 0) {
+        free_assets(&streamer->assets);
     }
 
     streamer->audio_socket_fd = create_media_socket(config->bind_ip, config->audio_port);
@@ -991,6 +1320,8 @@ void streamer_destroy(streamer_t *streamer)
     if (streamer->video_socket_fd >= 0) {
         close(streamer->video_socket_fd);
     }
+    media_queue_destroy(streamer->audio_queue_ptr);
+    media_queue_destroy(streamer->video_queue_ptr);
     free_assets(&streamer->assets);
     free(streamer);
 }
@@ -998,6 +1329,8 @@ void streamer_destroy(streamer_t *streamer)
 void streamer_stop(streamer_t *streamer)
 {
     streamer->stop_requested = 1;
+    media_queue_wake_and_stop(streamer->audio_queue_ptr);
+    media_queue_wake_and_stop(streamer->video_queue_ptr);
 
     if (streamer->video_running) {
         pthread_join(streamer->video_thread, NULL);
@@ -1017,25 +1350,19 @@ void streamer_stop(streamer_t *streamer)
     }
 }
 
-int streamer_start(streamer_t *streamer,
-                   const char *remote_ip,
-                   const char *remote_ip_alt,
-                   uint16_t audio_port,
-                   uint16_t video_port,
-                   uint8_t audio_payload_type,
-                   uint8_t video_payload_type)
+int streamer_start(streamer_t *streamer, const streamer_session_params_t *params)
 {
+    if (streamer == NULL || params == NULL) {
+        return -1;
+    }
+
     streamer_stop(streamer);
+    media_queue_reset(streamer->audio_queue_ptr);
+    media_queue_reset(streamer->video_queue_ptr);
     streamer->stop_requested = 0;
+    streamer->session = *params;
 
-    snprintf(streamer->remote_ip, sizeof(streamer->remote_ip), "%s", remote_ip);
-    snprintf(streamer->remote_ip_alt, sizeof(streamer->remote_ip_alt), "%s", remote_ip_alt != NULL ? remote_ip_alt : "");
-    streamer->remote_audio_port = audio_port;
-    streamer->remote_video_port = video_port;
-    streamer->remote_audio_payload_type = audio_payload_type;
-    streamer->remote_video_payload_type = video_payload_type;
-
-    if (streamer->receive_callback != NULL && video_port != 0) {
+    if (streamer->receive_callback != NULL && params->video_enabled && params->video_port != 0) {
         streamer->video_receive_args.streamer = streamer;
         streamer->video_receive_args.kind = STREAMER_MEDIA_VIDEO;
         streamer->video_receive_args.socket_fd = streamer->video_socket_fd;
@@ -1048,7 +1375,7 @@ int streamer_start(streamer_t *streamer,
         }
     }
 
-    if (streamer->receive_callback != NULL && audio_port != 0) {
+    if (streamer->receive_callback != NULL && params->audio_port != 0) {
         streamer->audio_receive_args.streamer = streamer;
         streamer->audio_receive_args.kind = STREAMER_MEDIA_AUDIO;
         streamer->audio_receive_args.socket_fd = streamer->audio_socket_fd;
@@ -1061,7 +1388,7 @@ int streamer_start(streamer_t *streamer,
         }
     }
 
-    if (video_port != 0 && streamer->assets.h264.enabled) {
+    if (params->video_enabled && params->video_port != 0) {
         if (pthread_create(&streamer->video_thread, NULL, video_thread_main, streamer) == 0) {
             streamer->video_running = 1;
         } else {
@@ -1070,26 +1397,22 @@ int streamer_start(streamer_t *streamer,
         }
     }
 
-    if (audio_port != 0) {
-        int has_audio = (streamer->config->audio_codec == AUDIO_CODEC_AAC && streamer->assets.aac.enabled) ||
-                        (streamer->config->audio_codec == AUDIO_CODEC_G711A && streamer->assets.g711a.enabled);
-        if (has_audio) {
-            if (pthread_create(&streamer->audio_thread, NULL, audio_thread_main, streamer) == 0) {
-                streamer->audio_running = 1;
-            } else {
-                perror("pthread_create(audio)");
-                streamer_stop(streamer);
-                return -1;
-            }
+    if (params->audio_port != 0) {
+        if (pthread_create(&streamer->audio_thread, NULL, audio_thread_main, streamer) == 0) {
+            streamer->audio_running = 1;
+        } else {
+            perror("pthread_create(audio)");
+            streamer_stop(streamer);
+            return -1;
         }
     }
 
     fprintf(stdout,
-            "media streaming to %s audio=%u video=%u codec=%s\n",
-            streamer->remote_ip,
-            streamer->remote_audio_port,
-            streamer->remote_video_port,
-            config_audio_codec_name(streamer->config->audio_codec));
+            "media session to %s audio=%u video=%u codec=%s\n",
+            streamer->session.remote_ip,
+            streamer->session.audio_port,
+            streamer->session.video_port,
+            config_audio_codec_name(streamer->session.audio_codec));
 
     return 0;
 }

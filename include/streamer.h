@@ -50,18 +50,38 @@ typedef struct {
 
 typedef void (*streamer_receive_callback_t)(const streamer_rtp_packet_t *packet, void *user_data);
 
+typedef struct {
+    char remote_ip[64];
+    char remote_ip_alt[64];
+    uint16_t audio_port;
+    uint16_t video_port;
+    uint8_t audio_payload_type;
+    uint8_t video_payload_type;
+    audio_codec_t audio_codec;
+    int video_enabled;
+    int live_input_only;
+} streamer_session_params_t;
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    uint32_t timestamp;
+} streamer_audio_frame_t;
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    uint32_t timestamp;
+} streamer_video_frame_t;
+
 streamer_t *streamer_create(const app_config_t *config);
 void streamer_destroy(streamer_t *streamer);
 void streamer_set_receive_callback(streamer_t *streamer,
                                    streamer_receive_callback_t callback,
                                    void *user_data);
-int streamer_start(streamer_t *streamer,
-                   const char *remote_ip,
-                   const char *remote_ip_alt,
-                   uint16_t audio_port,
-                   uint16_t video_port,
-                   uint8_t audio_payload_type,
-                   uint8_t video_payload_type);
+int streamer_start(streamer_t *streamer, const streamer_session_params_t *params);
+int streamer_push_audio_frame(streamer_t *streamer, const streamer_audio_frame_t *frame);
+int streamer_push_video_frame(streamer_t *streamer, const streamer_video_frame_t *frame);
 void streamer_stop(streamer_t *streamer);
 int streamer_build_sdp(const streamer_t *streamer,
                        const streamer_sdp_plan_t *plan,
