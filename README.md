@@ -6,7 +6,7 @@
 - 媒体传输走 UDP/RTP
 - 视频支持 H264
 - 音频支持 AAC 和 G711A
-- 测试素材来自当前目录的 `dlc_video.mp4`
+- 测试素材来自当前目录的 `video.mp4`
 - `ffmpeg` 仅用于离线生成演示用测试码流，和 `sipserver` 运行时完全解耦
 
 ## 目录结构
@@ -76,7 +76,7 @@
 
 ## 媒体准备
 
-先把 `dlc_video.mp4` 转成 `sipserver` 测试使用的裸码流：
+先把 `video.mp4` 转成 `sipserver` 测试使用的裸码流：
 
 ```bash
 chmod +x scripts/prepare_media.sh
