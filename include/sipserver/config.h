@@ -10,10 +10,17 @@ typedef enum {
     AUDIO_CODEC_G711A = 1
 } audio_codec_t;
 
+/* 支持的 SIP 信令传输方式。 */
+typedef enum {
+    SIP_TRANSPORT_UDP = 0,
+    SIP_TRANSPORT_TCP = 1
+} sip_transport_t;
+
 /* 应用启动参数与运行期配置。 */
 typedef struct {
     char bind_ip[64];
     char media_ip[64];
+    sip_transport_t sip_transport;
     uint16_t sip_port;
     uint16_t audio_port;
     uint16_t video_port;
@@ -32,5 +39,7 @@ int config_parse(app_config_t *config, int argc, char **argv);
 void config_print_usage(FILE *stream, const char *program_name);
 /* 返回音频编码名称字符串。 */
 const char *config_audio_codec_name(audio_codec_t codec);
+/* 返回 SIP 传输方式名称字符串。 */
+const char *config_sip_transport_name(sip_transport_t transport);
 
 #endif

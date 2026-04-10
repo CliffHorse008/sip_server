@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <stdint.h>
@@ -14,6 +15,7 @@
 #include "internal/net.h"
 
 #define SIP_BUFFER_SIZE 8192
+#define SIP_STREAM_BUFFER_SIZE 32768
 #define SDP_MAX_PAYLOADS 16
 #define SIP_TIMER_T1_MS 500LL
 #define SIP_TIMER_T2_MS 4000LL
@@ -251,6 +253,50 @@ static const char *get_body(const char *message)
     return separator == NULL ? NULL : separator + 4;
 }
 
+static int parse_content_length(const char *message, size_t *content_length)
+{
+    char value[64];
+    char *end = NULL;
+    unsigned long parsed;
+
+    *content_length = 0;
+    if (!get_header_value(message, "Content-Length", value, sizeof(value))) {
+        return 0;
+    }
+
+    parsed = strtoul(value, &end, 10);
+    if (value[0] == '\0' || end == NULL || *end != '\0') {
+        return -1;
+    }
+
+    *content_length = (size_t) parsed;
+    return 0;
+}
+
+static int sip_stream_try_extract_message_length(const char *buffer, size_t buffered, size_t *message_length)
+{
+    const char *header_end = strstr(buffer, "\r\n\r\n");
+    size_t header_length;
+    size_t content_length;
+
+    *message_length = 0;
+    if (header_end == NULL) {
+        return 0;
+    }
+
+    header_length = (size_t) (header_end - buffer) + 4U;
+    if (parse_content_length(buffer, &content_length) != 0) {
+        return -1;
+    }
+
+    if (buffered < header_length + content_length) {
+        return 0;
+    }
+
+    *message_length = header_length + content_length;
+    return 1;
+}
+
 static int parse_request(const char *message, const struct sockaddr_in *peer, sip_request_t *request)
 {
     char first_line[256];
@@ -297,20 +343,25 @@ static void build_to_header(const char *original_to, const char *local_tag, char
     snprintf(buffer, buffer_size, "%s;tag=%s", original_to, local_tag);
 }
 
-static void build_via_header(const sip_request_t *request, char *buffer, size_t buffer_size)
+static void build_via_header(const sip_request_t *request,
+                             sip_transport_t transport,
+                             char *buffer,
+                             size_t buffer_size)
 {
     char temp[1100];
     char *rport_marker;
 
     snprintf(buffer, buffer_size, "%s", request->via);
 
-    rport_marker = strstr(buffer, ";rport");
-    if (rport_marker != NULL && strncmp(rport_marker, ";rport=", 7) != 0) {
-        const char *suffix = rport_marker + 6;
+    if (transport == SIP_TRANSPORT_UDP) {
+        rport_marker = strstr(buffer, ";rport");
+        if (rport_marker != NULL && strncmp(rport_marker, ";rport=", 7) != 0) {
+            const char *suffix = rport_marker + 6;
 
-        *rport_marker = '\0';
-        snprintf(temp, sizeof(temp), "%s;rport=%u%s", buffer, request->source_port, suffix);
-        snprintf(buffer, buffer_size, "%s", temp);
+            *rport_marker = '\0';
+            snprintf(temp, sizeof(temp), "%s;rport=%u%s", buffer, request->source_port, suffix);
+            snprintf(buffer, buffer_size, "%s", temp);
+        }
     }
 
     if (request->source_ip[0] != '\0' && strstr(buffer, ";received=") == NULL) {
@@ -332,11 +383,16 @@ static int send_response(int sock,
     char packet[SIP_BUFFER_SIZE];
     char to_header[1100];
     char via_header[1100];
+    char contact_transport[32];
     size_t body_length = body == NULL ? 0U : strlen(body);
     int written;
 
     build_to_header(request->to, local_tag, to_header, sizeof(to_header));
-    build_via_header(request, via_header, sizeof(via_header));
+    build_via_header(request, config->sip_transport, via_header, sizeof(via_header));
+    snprintf(contact_transport,
+             sizeof(contact_transport),
+             "%s",
+             config->sip_transport == SIP_TRANSPORT_TCP ? ";transport=tcp" : "");
 
     written = snprintf(packet,
                        sizeof(packet),
@@ -346,7 +402,7 @@ static int send_response(int sock,
                        "To: %s\r\n"
                        "Call-ID: %s\r\n"
                        "CSeq: %d %s\r\n"
-                       "Contact: <sip:sipserver@%s:%u>\r\n"
+                       "Contact: <sip:sipserver@%s:%u%s>\r\n"
                        "Server: sipserver/0.1\r\n"
                        "%s"
                        "%s"
@@ -363,6 +419,7 @@ static int send_response(int sock,
                        request->cseq_method[0] == '\0' ? request->method : request->cseq_method,
                        config->media_ip,
                        config->sip_port,
+                       contact_transport,
                        body != NULL ? "Content-Type: application/sdp\r\n" : "",
                        extra_headers != NULL ? extra_headers : "",
                        body_length,
@@ -373,9 +430,26 @@ static int send_response(int sock,
         return -1;
     }
 
-    if (sendto(sock, packet, (size_t) written, 0, (const struct sockaddr *) peer, sizeof(*peer)) < 0) {
-        perror("sendto");
-        return -1;
+    if (config->sip_transport == SIP_TRANSPORT_TCP) {
+        size_t sent = 0;
+
+        while (sent < (size_t) written) {
+            ssize_t current = send(sock, packet + sent, (size_t) written - sent, 0);
+
+            if (current < 0) {
+                perror("send");
+                return -1;
+            }
+            if (current == 0) {
+                return -1;
+            }
+            sent += (size_t) current;
+        }
+    } else {
+        if (sendto(sock, packet, (size_t) written, 0, (const struct sockaddr *) peer, sizeof(*peer)) < 0) {
+            perror("sendto");
+            return -1;
+        }
     }
 
     return 0;
@@ -1360,12 +1434,422 @@ static void summarize_offer_for_upper_layer(const sdp_offer_t *offer,
     }
 }
 
+static void handle_sip_message(int message_socket,
+                               const struct sockaddr_in *peer,
+                               char *buffer,
+                               const app_config_t *config,
+                               const sip_server_handlers_t *handlers,
+                               streamer_t *streamer,
+                               sip_dialog_t *dialog,
+                               terminated_dialog_t *terminated_dialogs,
+                               invite_transaction_t *invite_transactions)
+{
+    sip_request_t request;
+    terminated_dialog_t *matched_terminated_bye = NULL;
+    int duplicate_bye_after_termination = 0;
+
+    if (parse_request(buffer, peer, &request) != 0) {
+        fprintf(stderr, "ignoring malformed SIP message\n");
+        return;
+    }
+
+    if (str_case_equal(request.method, "BYE") && !dialog_matches_for_termination(dialog, &request)) {
+        matched_terminated_bye =
+            terminated_dialog_find_match(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &request);
+        duplicate_bye_after_termination = matched_terminated_bye != NULL;
+    }
+
+    if (!duplicate_bye_after_termination) {
+        fprintf(stdout, "SIP %s from %s:%u\n", request.method, request.source_ip, request.source_port);
+    }
+
+    if (str_case_equal(request.method, "INVITE")) {
+        invite_transaction_t *matched_invite =
+            invite_transaction_find_match(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS, &request);
+
+        if (matched_invite != NULL) {
+            invite_transaction_send_cached(message_socket, config, handlers, streamer, matched_invite);
+            return;
+        }
+    }
+
+    if (str_case_equal(request.method, "ACK")) {
+        invite_transaction_t *acked_invite =
+            invite_transaction_find_ack(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS, &request);
+
+        if (acked_invite != NULL) {
+            invite_transaction_mark_acknowledged(acked_invite);
+        }
+    }
+
+    if (str_case_equal(request.method, "INVITE") &&
+        request_has_local_tag(&request, dialog->local_tag) &&
+        !dialog_matches(dialog, &request)) {
+        return;
+    }
+
+    if (str_case_equal(request.method, "INVITE")) {
+        emit_signal_event(handlers, streamer, SIP_SIGNAL_INVITE_RECEIVED, &request, NULL, 0, NULL, request.body);
+    } else if (str_case_equal(request.method, "ACK")) {
+        emit_signal_event(handlers, streamer, SIP_SIGNAL_ACK_RECEIVED, &request, NULL, 0, NULL, request.body);
+    } else if (str_case_equal(request.method, "OPTIONS")) {
+        emit_signal_event(handlers, streamer, SIP_SIGNAL_OPTIONS_RECEIVED, &request, NULL, 0, NULL, request.body);
+    } else if (str_case_equal(request.method, "REGISTER")) {
+        emit_signal_event(handlers, streamer, SIP_SIGNAL_REGISTER_RECEIVED, &request, NULL, 0, NULL, request.body);
+    }
+
+    if (str_case_equal(request.method, "INVITE") && dialog_conflicts_with_new_invite(dialog, &request)) {
+        char busy_local_tag[32];
+
+        generate_local_tag(busy_local_tag, sizeof(busy_local_tag));
+        fprintf(stdout,
+                "rejecting INVITE while dialog is active current_call_id=%s new_call_id=%s\n",
+                dialog->call_id,
+                request.call_id);
+        if (send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   486,
+                                   "Busy Here",
+                                   busy_local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer) == 0) {
+            invite_transaction_store_in_table(invite_transactions,
+                                              SIP_MAX_INVITE_TRANSACTIONS,
+                                              &request,
+                                              peer,
+                                              486,
+                                              "Busy Here",
+                                              busy_local_tag,
+                                              NULL,
+                                              NULL);
+        }
+        return;
+    }
+
+    if (str_case_equal(request.method, "OPTIONS") || str_case_equal(request.method, "REGISTER")) {
+        char local_tag[32];
+        generate_local_tag(local_tag, sizeof(local_tag));
+        send_response_and_emit(message_socket,
+                               peer,
+                               &request,
+                               200,
+                               "OK",
+                               local_tag,
+                               config,
+                               "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
+                               NULL,
+                               handlers,
+                               streamer);
+    } else if (str_case_equal(request.method, "CANCEL")) {
+        invite_transaction_t *matched_invite =
+            invite_transaction_find_match(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS, &request);
+
+        if (matched_invite != NULL) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   200,
+                                   "OK",
+                                   matched_invite->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+        } else {
+            char local_tag[32];
+
+            generate_local_tag(local_tag, sizeof(local_tag));
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   481,
+                                   "Call/Transaction Does Not Exist",
+                                   local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+        }
+    } else if (str_case_equal(request.method, "INVITE")) {
+        sip_invite_event_t invite_event;
+        sip_invite_response_t invite_response;
+        sdp_offer_t offer;
+        sip_offer_summary_t offer_summary;
+        int invite_rc;
+
+        streamer_stop(streamer);
+        if (dialog->active) {
+            terminated_dialog_store(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, dialog);
+            emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, NULL, dialog, 0, NULL, NULL);
+        }
+        dialog_reset(dialog);
+        memset(invite_transactions, 0, sizeof(invite_transaction_t) * SIP_MAX_INVITE_TRANSACTIONS);
+        generate_local_tag(dialog->local_tag, sizeof(dialog->local_tag));
+
+        if (send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   100,
+                                   "Trying",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer) != 0) {
+            dialog_reset(dialog);
+            return;
+        }
+
+        parse_sdp_offer(request.body, request.source_ip, &offer);
+        log_sdp_offer(&offer);
+        summarize_offer_for_upper_layer(&offer, config, &offer_summary);
+
+        prepare_invite_response_defaults(config, &invite_response);
+        if (handlers != NULL && handlers->on_invite != NULL) {
+            memset(&invite_event, 0, sizeof(invite_event));
+            invite_event.streamer = streamer;
+            invite_event.raw_message = buffer;
+            invite_event.offer_sdp = request.body;
+            invite_event.call_id = request.call_id;
+            invite_event.from = request.from;
+            invite_event.to = request.to;
+            invite_event.via = request.via;
+            invite_event.source_ip = request.source_ip;
+            invite_event.source_port = request.source_port;
+            invite_event.offer_connection_ip = offer_summary.connection_ip;
+            invite_event.offer_audio_present = offer_summary.audio_present;
+            invite_event.offer_video_present = offer_summary.video_present;
+            invite_event.offer_audio_transport = offer_summary.audio_transport;
+            invite_event.offer_video_transport = offer_summary.video_transport;
+            invite_event.offer_audio_port = offer_summary.audio_port;
+            invite_event.offer_video_port = offer_summary.video_port;
+            invite_event.offer_audio_payload_type = offer_summary.audio_payload_type;
+            invite_event.offer_video_payload_type = offer_summary.video_payload_type;
+            invite_rc = handlers->on_invite(&invite_event, &invite_response, handlers->user_data);
+        } else {
+            invite_rc = build_default_invite_response(&offer, config, streamer, &invite_response);
+        }
+
+        if (invite_rc != 0) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   500,
+                                   "Server Error",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            dialog_reset(dialog);
+            return;
+        }
+
+        normalize_invite_response(&request, config, &invite_response);
+
+        if (!invite_response.accept) {
+            if (send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       invite_response.status_code,
+                                       invite_response.reason_phrase,
+                                       dialog->local_tag,
+                                       config,
+                                       NULL,
+                                       NULL,
+                                       handlers,
+                                       streamer) == 0) {
+                invite_transaction_store_in_table(invite_transactions,
+                                                  SIP_MAX_INVITE_TRANSACTIONS,
+                                                  &request,
+                                                  peer,
+                                                  invite_response.status_code,
+                                                  invite_response.reason_phrase,
+                                                  dialog->local_tag,
+                                                  NULL,
+                                                  NULL);
+            }
+            dialog_reset(dialog);
+            return;
+        }
+
+        if (invite_response.answer_sdp[0] == '\0') {
+            if (send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       500,
+                                       "Server Error",
+                                       dialog->local_tag,
+                                       config,
+                                       NULL,
+                                       NULL,
+                                       handlers,
+                                       streamer) == 0) {
+                invite_transaction_store_in_table(invite_transactions,
+                                                  SIP_MAX_INVITE_TRANSACTIONS,
+                                                  &request,
+                                                  peer,
+                                                  500,
+                                                  "Server Error",
+                                                  dialog->local_tag,
+                                                  NULL,
+                                                  NULL);
+            }
+            dialog_reset(dialog);
+            return;
+        }
+
+        dialog_init_from_request(dialog, &request);
+        dialog->media = invite_response.media;
+
+        if (invite_response.send_ringing) {
+            if (send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       180,
+                                       "Ringing",
+                                       dialog->local_tag,
+                                       config,
+                                       NULL,
+                                       NULL,
+                                       handlers,
+                                       streamer) != 0) {
+                dialog_reset(dialog);
+                return;
+            }
+        }
+
+        if (send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   invite_response.status_code,
+                                   invite_response.reason_phrase,
+                                   dialog->local_tag,
+                                   config,
+                                   "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
+                                   invite_response.answer_sdp,
+                                   handlers,
+                                   streamer) != 0) {
+            dialog_reset(dialog);
+            return;
+        }
+        invite_transaction_store_in_table(invite_transactions,
+                                          SIP_MAX_INVITE_TRANSACTIONS,
+                                          &request,
+                                          peer,
+                                          invite_response.status_code,
+                                          invite_response.reason_phrase,
+                                          dialog->local_tag,
+                                          "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
+                                          invite_response.answer_sdp);
+    } else if (str_case_equal(request.method, "ACK")) {
+        if (dialog_matches(dialog, &request) && !dialog->established) {
+            if (request.source_ip[0] != '\0' && strcmp(request.source_ip, dialog->media.remote_ip) != 0) {
+                snprintf(dialog->media.remote_ip_alt, sizeof(dialog->media.remote_ip_alt), "%s", request.source_ip);
+            }
+            if (streamer_start(streamer, &dialog->media) == 0) {
+                dialog->established = 1;
+                emit_signal_event(handlers,
+                                  streamer,
+                                  SIP_SIGNAL_DIALOG_ESTABLISHED,
+                                  &request,
+                                  dialog,
+                                  0,
+                                  NULL,
+                                  NULL);
+            }
+        }
+    } else if (str_case_equal(request.method, "BYE")) {
+        if (dialog_matches_for_termination(dialog, &request)) {
+            if (!dialog_matches(dialog, &request)) {
+                fprintf(stdout,
+                        "BYE matched active dialog by relaxed identity call_id=%s source=%s:%u\n",
+                        request.call_id,
+                        request.source_ip,
+                        request.source_port);
+            }
+            emit_signal_event(handlers, streamer, SIP_SIGNAL_BYE_RECEIVED, &request, NULL, 0, NULL, request.body);
+            streamer_stop(streamer);
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   200,
+                                   "OK",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            terminated_dialog_store(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, dialog);
+            emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, &request, dialog, 0, NULL, NULL);
+            dialog_reset(dialog);
+        } else {
+            if (matched_terminated_bye == NULL) {
+                matched_terminated_bye =
+                    terminated_dialog_find_match(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &request);
+            }
+
+            if (matched_terminated_bye != NULL) {
+                send_response_maybe_emit(message_socket,
+                                         peer,
+                                         &request,
+                                         200,
+                                         "OK",
+                                         matched_terminated_bye->local_tag,
+                                         config,
+                                         NULL,
+                                         NULL,
+                                         handlers,
+                                         streamer,
+                                         0);
+            } else {
+                char local_tag[32];
+
+                generate_local_tag(local_tag, sizeof(local_tag));
+                send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       481,
+                                       "Call/Transaction Does Not Exist",
+                                       local_tag,
+                                       config,
+                                       NULL,
+                                       NULL,
+                                       handlers,
+                                       streamer);
+            }
+        }
+    } else {
+        char local_tag[32];
+        generate_local_tag(local_tag, sizeof(local_tag));
+        send_response_and_emit(message_socket,
+                               peer,
+                               &request,
+                               405,
+                               "Method Not Allowed",
+                               local_tag,
+                               config,
+                               NULL,
+                               NULL,
+                               handlers,
+                               streamer);
+    }
+}
+
 int sip_server_run_with_handlers(const app_config_t *config,
                                  volatile sig_atomic_t *stop_flag,
                                  const sip_server_handlers_t *handlers)
 {
     int sip_socket;
-    struct timeval timeout;
     streamer_t *streamer;
     sip_dialog_t dialog;
     terminated_dialog_t terminated_dialogs[SIP_MAX_TERMINATED_DIALOGS];
@@ -1379,446 +1863,206 @@ int sip_server_run_with_handlers(const app_config_t *config,
                                   handlers != NULL ? handlers->on_media : NULL,
                                   handlers != NULL ? handlers->user_data : NULL);
 
-    sip_socket = udp_socket_bind(config->bind_ip, config->sip_port);
+    if (config->sip_transport == SIP_TRANSPORT_TCP) {
+        sip_socket = tcp_socket_listen(config->bind_ip, config->sip_port, 4);
+    } else {
+        struct timeval timeout;
+
+        sip_socket = udp_socket_bind(config->bind_ip, config->sip_port);
+        if (sip_socket >= 0) {
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 100000;
+            if (setsockopt(sip_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+                perror("setsockopt(SO_RCVTIMEO)");
+            }
+        }
+    }
     if (sip_socket < 0) {
         streamer_destroy(streamer);
         return 1;
-    }
-
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 100000;
-    if (setsockopt(sip_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
-        perror("setsockopt(SO_RCVTIMEO)");
     }
 
     dialog_reset(&dialog);
     memset(terminated_dialogs, 0, sizeof(terminated_dialogs));
     memset(invite_transactions, 0, sizeof(invite_transactions));
 
-    while (*stop_flag == 0) {
-        char buffer[SIP_BUFFER_SIZE];
-        struct sockaddr_in peer;
-        socklen_t peer_len = sizeof(peer);
+    if (config->sip_transport == SIP_TRANSPORT_UDP) {
+        while (*stop_flag == 0) {
+            char buffer[SIP_BUFFER_SIZE];
+            struct sockaddr_in peer;
+            socklen_t peer_len = sizeof(peer);
+            ssize_t received;
 
-        terminated_dialog_table_cleanup(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS);
-        invite_transaction_table_cleanup(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS);
-        invite_transaction_maybe_retransmit_all(sip_socket,
-                                                config,
-                                                handlers,
-                                                streamer,
-                                                invite_transactions,
-                                                SIP_MAX_INVITE_TRANSACTIONS);
-        ssize_t received = recvfrom(sip_socket, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *) &peer, &peer_len);
+            terminated_dialog_table_cleanup(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS);
+            invite_transaction_table_cleanup(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS);
+            invite_transaction_maybe_retransmit_all(sip_socket,
+                                                    config,
+                                                    handlers,
+                                                    streamer,
+                                                    invite_transactions,
+                                                    SIP_MAX_INVITE_TRANSACTIONS);
 
-        if (received < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            received = recvfrom(sip_socket,
+                                buffer,
+                                sizeof(buffer) - 1,
+                                0,
+                                (struct sockaddr *) &peer,
+                                &peer_len);
+            if (received < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    continue;
+                }
                 continue;
             }
-            continue;
+
+            buffer[received] = '\0';
+            handle_sip_message(sip_socket,
+                               &peer,
+                               buffer,
+                               config,
+                               handlers,
+                               streamer,
+                               &dialog,
+                               terminated_dialogs,
+                               invite_transactions);
+        }
+    } else {
+        int client_socket = -1;
+        char stream_buffer[SIP_STREAM_BUFFER_SIZE + 1];
+        size_t buffered = 0;
+        struct sockaddr_in client_peer;
+
+        memset(&client_peer, 0, sizeof(client_peer));
+        stream_buffer[0] = '\0';
+
+        while (*stop_flag == 0) {
+            fd_set read_fds;
+            struct timeval timeout;
+            int ready;
+            int max_fd = sip_socket;
+
+            terminated_dialog_table_cleanup(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS);
+            invite_transaction_table_cleanup(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS);
+
+            FD_ZERO(&read_fds);
+            FD_SET(sip_socket, &read_fds);
+            if (client_socket >= 0) {
+                FD_SET(client_socket, &read_fds);
+                if (client_socket > max_fd) {
+                    max_fd = client_socket;
+                }
+            }
+
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 100000;
+            ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                continue;
+            }
+            if (ready == 0) {
+                continue;
+            }
+
+            if (FD_ISSET(sip_socket, &read_fds)) {
+                struct sockaddr_in accepted_peer;
+                socklen_t accepted_peer_len = sizeof(accepted_peer);
+                int accepted_socket = accept(sip_socket,
+                                             (struct sockaddr *) &accepted_peer,
+                                             &accepted_peer_len);
+
+                if (accepted_socket >= 0) {
+                    if (client_socket >= 0) {
+                        close(accepted_socket);
+                    } else {
+                        client_socket = accepted_socket;
+                        client_peer = accepted_peer;
+                        buffered = 0;
+                        stream_buffer[0] = '\0';
+                    }
+                }
+            }
+
+            if (client_socket >= 0 && FD_ISSET(client_socket, &read_fds)) {
+                ssize_t received;
+
+                if (buffered >= SIP_STREAM_BUFFER_SIZE) {
+                    close(client_socket);
+                    client_socket = -1;
+                    buffered = 0;
+                    stream_buffer[0] = '\0';
+                    continue;
+                }
+
+                received = recv(client_socket,
+                                stream_buffer + buffered,
+                                SIP_STREAM_BUFFER_SIZE - buffered,
+                                0);
+                if (received <= 0) {
+                    close(client_socket);
+                    client_socket = -1;
+                    buffered = 0;
+                    stream_buffer[0] = '\0';
+                    continue;
+                }
+
+                buffered += (size_t) received;
+                stream_buffer[buffered] = '\0';
+
+                while (client_socket >= 0) {
+                    size_t message_length;
+                    int frame_rc =
+                        sip_stream_try_extract_message_length(stream_buffer, buffered, &message_length);
+
+                    if (frame_rc < 0) {
+                        fprintf(stderr, "invalid SIP over TCP framing\n");
+                        close(client_socket);
+                        client_socket = -1;
+                        buffered = 0;
+                        stream_buffer[0] = '\0';
+                        break;
+                    }
+                    if (frame_rc == 0) {
+                        break;
+                    }
+
+                    {
+                        char saved = stream_buffer[message_length];
+
+                        stream_buffer[message_length] = '\0';
+                        handle_sip_message(client_socket,
+                                           &client_peer,
+                                           stream_buffer,
+                                           config,
+                                           handlers,
+                                           streamer,
+                                           &dialog,
+                                           terminated_dialogs,
+                                           invite_transactions);
+                        stream_buffer[message_length] = saved;
+                    }
+
+                    buffered -= message_length;
+                    if (buffered > 0) {
+                        memmove(stream_buffer, stream_buffer + message_length, buffered);
+                    }
+                    stream_buffer[buffered] = '\0';
+                }
+
+                if (client_socket >= 0 && buffered >= SIP_STREAM_BUFFER_SIZE) {
+                    fprintf(stderr, "SIP over TCP message too large\n");
+                    close(client_socket);
+                    client_socket = -1;
+                    buffered = 0;
+                    stream_buffer[0] = '\0';
+                }
+            }
         }
 
-        buffer[received] = '\0';
-
-        {
-            sip_request_t request;
-            terminated_dialog_t *matched_terminated_bye = NULL;
-            int duplicate_bye_after_termination = 0;
-
-            if (parse_request(buffer, &peer, &request) != 0) {
-                fprintf(stderr, "ignoring malformed SIP message\n");
-                continue;
-            }
-
-            if (str_case_equal(request.method, "BYE") && !dialog_matches_for_termination(&dialog, &request)) {
-                matched_terminated_bye =
-                    terminated_dialog_find_match(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &request);
-                duplicate_bye_after_termination = matched_terminated_bye != NULL;
-            }
-
-            if (!duplicate_bye_after_termination) {
-                fprintf(stdout, "SIP %s from %s:%u\n", request.method, request.source_ip, request.source_port);
-            }
-
-            if (str_case_equal(request.method, "INVITE")) {
-                invite_transaction_t *matched_invite =
-                    invite_transaction_find_match(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS, &request);
-
-                if (matched_invite != NULL) {
-                    invite_transaction_send_cached(sip_socket, config, handlers, streamer, matched_invite);
-                    continue;
-                }
-            }
-
-            if (str_case_equal(request.method, "ACK")) {
-                invite_transaction_t *acked_invite =
-                    invite_transaction_find_ack(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS, &request);
-
-                if (acked_invite != NULL) {
-                    invite_transaction_mark_acknowledged(acked_invite);
-                }
-            }
-
-            if (str_case_equal(request.method, "INVITE") &&
-                request_has_local_tag(&request, dialog.local_tag) &&
-                !dialog_matches(&dialog, &request)) {
-                continue;
-            }
-
-            if (str_case_equal(request.method, "INVITE")) {
-                emit_signal_event(handlers, streamer, SIP_SIGNAL_INVITE_RECEIVED, &request, NULL, 0, NULL, request.body);
-            } else if (str_case_equal(request.method, "ACK")) {
-                emit_signal_event(handlers, streamer, SIP_SIGNAL_ACK_RECEIVED, &request, NULL, 0, NULL, request.body);
-            } else if (str_case_equal(request.method, "OPTIONS")) {
-                emit_signal_event(handlers, streamer, SIP_SIGNAL_OPTIONS_RECEIVED, &request, NULL, 0, NULL, request.body);
-            } else if (str_case_equal(request.method, "REGISTER")) {
-                emit_signal_event(handlers, streamer, SIP_SIGNAL_REGISTER_RECEIVED, &request, NULL, 0, NULL, request.body);
-            }
-
-            if (str_case_equal(request.method, "INVITE") && dialog_conflicts_with_new_invite(&dialog, &request)) {
-                char busy_local_tag[32];
-
-                generate_local_tag(busy_local_tag, sizeof(busy_local_tag));
-                fprintf(stdout,
-                        "rejecting INVITE while dialog is active current_call_id=%s new_call_id=%s\n",
-                        dialog.call_id,
-                        request.call_id);
-                if (send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           486,
-                                           "Busy Here",
-                                           busy_local_tag,
-                                           config,
-                                           NULL,
-                                           NULL,
-                                           handlers,
-                                           streamer) == 0) {
-                    invite_transaction_store_in_table(invite_transactions,
-                                                      SIP_MAX_INVITE_TRANSACTIONS,
-                                                      &request,
-                                                      &peer,
-                                                      486,
-                                                      "Busy Here",
-                                                      busy_local_tag,
-                                                      NULL,
-                                                      NULL);
-                }
-                continue;
-            }
-
-            if (str_case_equal(request.method, "OPTIONS") || str_case_equal(request.method, "REGISTER")) {
-                char local_tag[32];
-                generate_local_tag(local_tag, sizeof(local_tag));
-                send_response_and_emit(sip_socket,
-                                       &peer,
-                                       &request,
-                                       200,
-                                       "OK",
-                                       local_tag,
-                                       config,
-                                       "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
-                                       NULL,
-                                       handlers,
-                                       streamer);
-            } else if (str_case_equal(request.method, "CANCEL")) {
-                invite_transaction_t *matched_invite =
-                    invite_transaction_find_match(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS, &request);
-
-                if (matched_invite != NULL) {
-                    send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           200,
-                                           "OK",
-                                           matched_invite->local_tag,
-                                           config,
-                                           NULL,
-                                           NULL,
-                                           handlers,
-                                           streamer);
-                } else {
-                    char local_tag[32];
-
-                    generate_local_tag(local_tag, sizeof(local_tag));
-                    send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           481,
-                                           "Call/Transaction Does Not Exist",
-                                           local_tag,
-                                           config,
-                                           NULL,
-                                           NULL,
-                                           handlers,
-                                           streamer);
-                }
-            } else if (str_case_equal(request.method, "INVITE")) {
-                sip_invite_event_t invite_event;
-                sip_invite_response_t invite_response;
-                sdp_offer_t offer;
-                sip_offer_summary_t offer_summary;
-                int invite_rc;
-
-                streamer_stop(streamer);
-                if (dialog.active) {
-                    terminated_dialog_store(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &dialog);
-                    emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, NULL, &dialog, 0, NULL, NULL);
-                }
-                dialog_reset(&dialog);
-                memset(invite_transactions, 0, sizeof(invite_transactions));
-                generate_local_tag(dialog.local_tag, sizeof(dialog.local_tag));
-
-                if (send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           100,
-                                           "Trying",
-                                           dialog.local_tag,
-                                           config,
-                                           NULL,
-                                           NULL,
-                                           handlers,
-                                           streamer) != 0) {
-                    dialog_reset(&dialog);
-                    continue;
-                }
-
-                parse_sdp_offer(request.body, request.source_ip, &offer);
-                log_sdp_offer(&offer);
-                summarize_offer_for_upper_layer(&offer, config, &offer_summary);
-
-                prepare_invite_response_defaults(config, &invite_response);
-                if (handlers != NULL && handlers->on_invite != NULL) {
-                    memset(&invite_event, 0, sizeof(invite_event));
-                    invite_event.streamer = streamer;
-                    invite_event.raw_message = buffer;
-                    invite_event.offer_sdp = request.body;
-                    invite_event.call_id = request.call_id;
-                    invite_event.from = request.from;
-                    invite_event.to = request.to;
-                    invite_event.via = request.via;
-                    invite_event.source_ip = request.source_ip;
-                    invite_event.source_port = request.source_port;
-                    invite_event.offer_connection_ip = offer_summary.connection_ip;
-                    invite_event.offer_audio_present = offer_summary.audio_present;
-                    invite_event.offer_video_present = offer_summary.video_present;
-                    invite_event.offer_audio_transport = offer_summary.audio_transport;
-                    invite_event.offer_video_transport = offer_summary.video_transport;
-                    invite_event.offer_audio_port = offer_summary.audio_port;
-                    invite_event.offer_video_port = offer_summary.video_port;
-                    invite_event.offer_audio_payload_type = offer_summary.audio_payload_type;
-                    invite_event.offer_video_payload_type = offer_summary.video_payload_type;
-                    invite_rc = handlers->on_invite(&invite_event, &invite_response, handlers->user_data);
-                } else {
-                    invite_rc = build_default_invite_response(&offer, config, streamer, &invite_response);
-                }
-
-                if (invite_rc != 0) {
-                    send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           500,
-                                           "Server Error",
-                                           dialog.local_tag,
-                                           config,
-                                           NULL,
-                                           NULL,
-                                           handlers,
-                                           streamer);
-                    dialog_reset(&dialog);
-                    continue;
-                }
-
-                normalize_invite_response(&request, config, &invite_response);
-
-                if (!invite_response.accept) {
-                    if (send_response_and_emit(sip_socket,
-                                               &peer,
-                                               &request,
-                                               invite_response.status_code,
-                                               invite_response.reason_phrase,
-                                               dialog.local_tag,
-                                               config,
-                                               NULL,
-                                               NULL,
-                                               handlers,
-                                               streamer) == 0) {
-                        invite_transaction_store_in_table(invite_transactions,
-                                                          SIP_MAX_INVITE_TRANSACTIONS,
-                                                          &request,
-                                                          &peer,
-                                                          invite_response.status_code,
-                                                          invite_response.reason_phrase,
-                                                          dialog.local_tag,
-                                                          NULL,
-                                                          NULL);
-                    }
-                    dialog_reset(&dialog);
-                    continue;
-                }
-
-                if (invite_response.answer_sdp[0] == '\0') {
-                    if (send_response_and_emit(sip_socket,
-                                               &peer,
-                                               &request,
-                                               500,
-                                               "Server Error",
-                                               dialog.local_tag,
-                                               config,
-                                               NULL,
-                                               NULL,
-                                               handlers,
-                                               streamer) == 0) {
-                        invite_transaction_store_in_table(invite_transactions,
-                                                          SIP_MAX_INVITE_TRANSACTIONS,
-                                                          &request,
-                                                          &peer,
-                                                          500,
-                                                          "Server Error",
-                                                          dialog.local_tag,
-                                                          NULL,
-                                                          NULL);
-                    }
-                    dialog_reset(&dialog);
-                    continue;
-                }
-
-                dialog_init_from_request(&dialog, &request);
-                dialog.media = invite_response.media;
-
-                if (invite_response.send_ringing) {
-                    if (send_response_and_emit(sip_socket,
-                                               &peer,
-                                               &request,
-                                               180,
-                                               "Ringing",
-                                               dialog.local_tag,
-                                               config,
-                                               NULL,
-                                               NULL,
-                                               handlers,
-                                               streamer) != 0) {
-                        dialog_reset(&dialog);
-                        continue;
-                    }
-                }
-
-                if (send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           invite_response.status_code,
-                                           invite_response.reason_phrase,
-                                           dialog.local_tag,
-                                           config,
-                                           "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
-                                           invite_response.answer_sdp,
-                                           handlers,
-                                           streamer) != 0) {
-                    dialog_reset(&dialog);
-                    continue;
-                }
-                invite_transaction_store_in_table(invite_transactions,
-                                                  SIP_MAX_INVITE_TRANSACTIONS,
-                                                  &request,
-                                                  &peer,
-                                                  invite_response.status_code,
-                                                  invite_response.reason_phrase,
-                                                  dialog.local_tag,
-                                                  "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
-                                                  invite_response.answer_sdp);
-            } else if (str_case_equal(request.method, "ACK")) {
-                if (dialog_matches(&dialog, &request) && !dialog.established) {
-                    if (request.source_ip[0] != '\0' && strcmp(request.source_ip, dialog.media.remote_ip) != 0) {
-                        snprintf(dialog.media.remote_ip_alt, sizeof(dialog.media.remote_ip_alt), "%s", request.source_ip);
-                    }
-                    if (streamer_start(streamer, &dialog.media) == 0) {
-                        dialog.established = 1;
-                        emit_signal_event(handlers,
-                                          streamer,
-                                          SIP_SIGNAL_DIALOG_ESTABLISHED,
-                                          &request,
-                                          &dialog,
-                                          0,
-                                          NULL,
-                                          NULL);
-                    }
-                }
-            } else if (str_case_equal(request.method, "BYE")) {
-                if (dialog_matches_for_termination(&dialog, &request)) {
-                    if (!dialog_matches(&dialog, &request)) {
-                        fprintf(stdout,
-                                "BYE matched active dialog by relaxed identity call_id=%s source=%s:%u\n",
-                                request.call_id,
-                                request.source_ip,
-                                request.source_port);
-                    }
-                    emit_signal_event(handlers, streamer, SIP_SIGNAL_BYE_RECEIVED, &request, NULL, 0, NULL, request.body);
-                    streamer_stop(streamer);
-                    send_response_and_emit(sip_socket,
-                                           &peer,
-                                           &request,
-                                           200,
-                                           "OK",
-                                           dialog.local_tag,
-                                           config,
-                                           NULL,
-                                           NULL,
-                                           handlers,
-                                           streamer);
-                    terminated_dialog_store(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &dialog);
-                    emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, &request, &dialog, 0, NULL, NULL);
-                    dialog_reset(&dialog);
-                } else {
-                    if (matched_terminated_bye == NULL) {
-                        matched_terminated_bye =
-                            terminated_dialog_find_match(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &request);
-                    }
-
-                    if (matched_terminated_bye != NULL) {
-                        send_response_maybe_emit(sip_socket,
-                                                 &peer,
-                                                 &request,
-                                                 200,
-                                                 "OK",
-                                                 matched_terminated_bye->local_tag,
-                                                 config,
-                                                 NULL,
-                                                 NULL,
-                                                 handlers,
-                                                 streamer,
-                                                 0);
-                    } else {
-                        char local_tag[32];
-
-                        generate_local_tag(local_tag, sizeof(local_tag));
-                        send_response_and_emit(sip_socket,
-                                               &peer,
-                                               &request,
-                                               481,
-                                               "Call/Transaction Does Not Exist",
-                                               local_tag,
-                                               config,
-                                               NULL,
-                                               NULL,
-                                               handlers,
-                                               streamer);
-                    }
-                }
-            } else {
-                char local_tag[32];
-                generate_local_tag(local_tag, sizeof(local_tag));
-                send_response_and_emit(sip_socket,
-                                       &peer,
-                                       &request,
-                                       405,
-                                       "Method Not Allowed",
-                                       local_tag,
-                                       config,
-                                       NULL,
-                                       NULL,
-                                       handlers,
-                                       streamer);
-            }
+        if (client_socket >= 0) {
+            close(client_socket);
         }
     }
 

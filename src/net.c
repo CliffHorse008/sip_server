@@ -51,6 +51,44 @@ int udp_socket_bind(const char *ip, uint16_t port)
     return fd;
 }
 
+int tcp_socket_listen(const char *ip, uint16_t port, int backlog)
+{
+    int fd;
+    int reuse = 1;
+    struct sockaddr_in addr;
+
+    if (sockaddr_from_ip_port(ip, port, &addr) != 0) {
+        fprintf(stderr, "invalid bind address: %s:%u\n", ip, port);
+        return -1;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+        perror("setsockopt(SO_REUSEADDR)");
+        close(fd);
+        return -1;
+    }
+
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+
+    if (listen(fd, backlog) != 0) {
+        perror("listen");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
 void sockaddr_to_ip_string(const struct sockaddr_in *addr, char *buffer, size_t buffer_size)
 {
     if (inet_ntop(AF_INET, &addr->sin_addr, buffer, (socklen_t) buffer_size) == NULL) {

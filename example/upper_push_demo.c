@@ -523,9 +523,10 @@ int main(int argc, char **argv)
     signal(SIGTERM, handle_signal);
 
     fprintf(stdout,
-            "sipserver starting on %s:%u, media=%s, audio_codec=%s, mode=upper-push-demo\n",
+            "sipserver starting on %s:%u/%s, media=%s, audio_codec=%s, mode=upper-push-demo\n",
             config.bind_ip,
             config.sip_port,
+            config_sip_transport_name(config.sip_transport),
             config.media_ip,
             config_audio_codec_name(config.audio_codec));
 

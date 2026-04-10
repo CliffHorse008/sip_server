@@ -2,7 +2,7 @@
 
 一个最小可编译的 SIP Server/RTP 发送/接收框架，使用 C 开发、CMake 构建，不依赖第三方运行库。当前仓库只保留“上层推流演示”这一种运行方式。工程目标是：
 
-- SIP 信令走 UDP，默认监听 `5060`
+- SIP 信令支持 UDP/TCP，默认监听 `5060/udp`
 - 媒体传输走 UDP/RTP
 - 视频支持 H264
 - 音频支持 AAC 和 G711A
@@ -53,7 +53,8 @@
 
 当前实现是“最小框架”，重点在工程骨架、上层送帧链路和 RTP 回调接入点：
 
-- 支持 SIP UDP 基础方法：`OPTIONS`、`REGISTER`、`INVITE`、`ACK`、`BYE`
+- 支持 SIP 基础方法：`OPTIONS`、`REGISTER`、`INVITE`、`ACK`、`BYE`
+- SIP 信令可运行在 UDP 或 TCP；RTP 媒体仍然固定走 UDP
 - 收到 `INVITE` 后解析对端 SDP 中的 `m=`、`rtpmap`、`fmtp`、方向属性和 RTP 端口
 - 会按 Offer 生成最小可用的 SDP Answer，并沿用对端的 payload type
 - 收到 `ACK` 后启动音视频 RTP 发送线程，等待上层持续送帧
@@ -137,7 +138,7 @@ build/libsipserver.a
 如果 SIP 客户端和本机不在同一台机器，`--media-ip` 必须设置为客户端可达的本机 IP。
 和 Linphone 联调时，当前更建议使用 `--audio-codec g711a`。
 
-AAC 模式：
+AAC 模式（UDP SIP）：
 
 ```bash
 ./build/sipserver_upper_push_demo \
@@ -146,7 +147,7 @@ AAC 模式：
   --audio-codec aac
 ```
 
-G711A 模式：
+G711A 模式（UDP SIP）：
 
 ```bash
 ./build/sipserver_upper_push_demo \
@@ -155,7 +156,7 @@ G711A 模式：
   --audio-codec g711a
 ```
 
-Linphone 示例：
+Linphone 示例（UDP SIP）：
 
 ```bash
 ./build/sipserver_upper_push_demo \
@@ -171,9 +172,25 @@ Linphone 示例：
 sip:test@192.168.18.126:6060;transport=udp
 ```
 
+Linphone 示例（TCP SIP）：
+
+```bash
+./build/sipserver_upper_push_demo \
+  --bind-ip 0.0.0.0 \
+  --media-ip 192.168.18.126 \
+  --sip-port 6060 \
+  --sip-transport tcp \
+  --audio-codec g711a
+```
+
+```text
+sip:test@192.168.18.126:6060;transport=tcp
+```
+
 常用参数：
 
 - `--sip-port`：SIP 监听端口，默认 `5060`
+- `--sip-transport`：SIP 信令传输方式，支持 `udp` / `tcp`，默认 `udp`
 - `--audio-port`：本地音频 RTP 端口，默认 `5004`
 - `--video-port`：本地视频 RTP 端口，默认 `5006`
 - `--video-fps`：视频发送节奏，默认 `30`

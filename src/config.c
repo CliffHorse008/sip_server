@@ -30,12 +30,27 @@ static int parse_double_value(const char *value, double *out)
     return 0;
 }
 
+static int parse_sip_transport(const char *value, sip_transport_t *out)
+{
+    if (strcmp(value, "udp") == 0) {
+        *out = SIP_TRANSPORT_UDP;
+        return 0;
+    }
+    if (strcmp(value, "tcp") == 0) {
+        *out = SIP_TRANSPORT_TCP;
+        return 0;
+    }
+
+    return -1;
+}
+
 void config_set_defaults(app_config_t *config)
 {
     memset(config, 0, sizeof(*config));
 
     snprintf(config->bind_ip, sizeof(config->bind_ip), "0.0.0.0");
     snprintf(config->media_ip, sizeof(config->media_ip), "127.0.0.1");
+    config->sip_transport = SIP_TRANSPORT_UDP;
     config->sip_port = 5060;
     config->audio_port = 5004;
     config->video_port = 5006;
@@ -51,13 +66,19 @@ const char *config_audio_codec_name(audio_codec_t codec)
     return codec == AUDIO_CODEC_G711A ? "g711a" : "aac";
 }
 
+const char *config_sip_transport_name(sip_transport_t transport)
+{
+    return transport == SIP_TRANSPORT_TCP ? "tcp" : "udp";
+}
+
 void config_print_usage(FILE *stream, const char *program_name)
 {
     fprintf(stream,
             "Usage: %s [options]\n"
             "  --bind-ip <ip>        SIP/RTP bind address, default 0.0.0.0\n"
             "  --media-ip <ip>       SDP announced media address, default 127.0.0.1\n"
-            "  --sip-port <port>     SIP UDP listen port, default 5060\n"
+            "  --sip-port <port>     SIP listen port, default 5060\n"
+            "  --sip-transport <t>   udp or tcp, default udp\n"
             "  --audio-port <port>   Local RTP audio port, default 5004\n"
             "  --video-port <port>   Local RTP video port, default 5006\n"
             "  --video-fps <fps>     H264 pacing FPS, default 30.0\n"
@@ -95,6 +116,11 @@ int config_parse(app_config_t *config, int argc, char **argv)
         } else if (strcmp(arg, "--sip-port") == 0) {
             if (parse_u16(argv[++index], &config->sip_port) != 0) {
                 fprintf(stderr, "invalid sip port\n");
+                return -1;
+            }
+        } else if (strcmp(arg, "--sip-transport") == 0) {
+            if (parse_sip_transport(argv[++index], &config->sip_transport) != 0) {
+                fprintf(stderr, "invalid sip transport\n");
                 return -1;
             }
         } else if (strcmp(arg, "--audio-port") == 0) {
