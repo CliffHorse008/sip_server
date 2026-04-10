@@ -7,7 +7,7 @@
 #include <time.h>
 
 #include "config.h"
-#include "sip_server.h"
+#include "sip_embed.h"
 
 /* G711A 在 8kHz 下每 20ms 对应 160 个采样。 */
 #define G711A_SAMPLES_PER_PACKET 160U
@@ -34,14 +34,12 @@ typedef struct {
     int video_thread_running;
 } sample_demo_media_t;
 
-/* 模拟上层 SDK 的上下文，保存当前会话与示例媒体状态。 */
+/* 示例宿主上下文，包含嵌入式服务实例与演示媒体状态。 */
 typedef struct {
     const app_config_t *config;
-    pthread_mutex_t mutex;
-    streamer_t *streamer;
-    unsigned int stream_generation;
+    sip_embed_service_t *service;
     sample_demo_media_t demo_media;
-} sample_sdk_t;
+} sample_host_t;
 
 /* 捕获退出信号，让主循环和工作线程尽快收敛。 */
 static void handle_signal(int signum)
@@ -63,43 +61,6 @@ static void sleep_ns(long long nanoseconds)
     ts.tv_nsec = (long) (nanoseconds % 1000000000LL);
     while (nanosleep(&ts, &ts) != 0 && g_stop == 0) {
     }
-}
-
-/* 将内部信令枚举转换为日志可读字符串。 */
-static const char *signal_name(sip_signal_type_t type)
-{
-    switch (type) {
-    case SIP_SIGNAL_INVITE_RECEIVED:
-        return "INVITE_RECEIVED";
-    case SIP_SIGNAL_ACK_RECEIVED:
-        return "ACK_RECEIVED";
-    case SIP_SIGNAL_BYE_RECEIVED:
-        return "BYE_RECEIVED";
-    case SIP_SIGNAL_OPTIONS_RECEIVED:
-        return "OPTIONS_RECEIVED";
-    case SIP_SIGNAL_REGISTER_RECEIVED:
-        return "REGISTER_RECEIVED";
-    case SIP_SIGNAL_RESPONSE_SENT:
-        return "RESPONSE_SENT";
-    case SIP_SIGNAL_DIALOG_ESTABLISHED:
-        return "DIALOG_ESTABLISHED";
-    case SIP_SIGNAL_DIALOG_TERMINATED:
-        return "DIALOG_TERMINATED";
-    default:
-        return "UNKNOWN";
-    }
-}
-
-/* 未指定 payload type 时，给音频协商一个默认值。 */
-static uint8_t default_audio_payload_type(audio_codec_t codec)
-{
-    return codec == AUDIO_CODEC_G711A ? 8 : 97;
-}
-
-/* 对端未声明传输协议时，退回最常见的 RTP/AVP。 */
-static const char *default_transport(const char *transport)
-{
-    return transport != NULL && transport[0] != '\0' ? transport : "RTP/AVP";
 }
 
 /* 一次性把整个文件读入内存，用于测试媒体加载。 */
@@ -271,221 +232,32 @@ static int demo_build_h264_access_units(sample_demo_media_t *demo_media)
     return demo_media->video_frame_count > 0 ? 0 : -1;
 }
 
-/* 线程安全地读取当前生效的 streamer 及其代数。 */
-static void sample_sdk_get_stream(sample_sdk_t *sdk, streamer_t **streamer, unsigned int *generation)
-{
-    pthread_mutex_lock(&sdk->mutex);
-    *streamer = sdk->streamer;
-    *generation = sdk->stream_generation;
-    pthread_mutex_unlock(&sdk->mutex);
-}
-
-/* 在会话建立/结束时更新当前 streamer，并推进代数。 */
-static void sample_sdk_set_stream(sample_sdk_t *sdk, streamer_t *streamer)
-{
-    pthread_mutex_lock(&sdk->mutex);
-    sdk->streamer = streamer;
-    ++sdk->stream_generation;
-    pthread_mutex_unlock(&sdk->mutex);
-}
-
 /* 由示例线程向当前会话投递一帧音频。 */
-static int sample_sdk_push_audio_frame(sample_sdk_t *sdk,
-                                       const uint8_t *payload,
-                                       size_t payload_size,
-                                       uint32_t rtp_timestamp)
+static int sample_host_push_audio_frame(sample_host_t *host,
+                                        const uint8_t *payload,
+                                        size_t payload_size,
+                                        uint32_t rtp_timestamp)
 {
-    streamer_audio_frame_t frame;
-    streamer_t *streamer;
-    unsigned int generation;
-
-    sample_sdk_get_stream(sdk, &streamer, &generation);
-    (void) generation;
-    if (streamer == NULL) {
-        return -1;
-    }
-
-    frame.data = payload;
-    frame.size = payload_size;
-    frame.timestamp = rtp_timestamp;
-    return streamer_push_audio_frame(streamer, &frame);
+    return sip_embed_service_push_audio_frame(host->service, payload, payload_size, rtp_timestamp);
 }
 
 /* 由示例线程向当前会话投递一帧视频。 */
-static int sample_sdk_push_video_frame(sample_sdk_t *sdk,
-                                       const uint8_t *access_unit,
-                                       size_t access_unit_size,
-                                       uint32_t rtp_timestamp)
+static int sample_host_push_video_frame(sample_host_t *host,
+                                        const uint8_t *access_unit,
+                                        size_t access_unit_size,
+                                        uint32_t rtp_timestamp)
 {
-    streamer_video_frame_t frame;
-    streamer_t *streamer;
-    unsigned int generation;
-
-    sample_sdk_get_stream(sdk, &streamer, &generation);
-    (void) generation;
-    if (streamer == NULL) {
-        return -1;
-    }
-
-    frame.data = access_unit;
-    frame.size = access_unit_size;
-    frame.timestamp = rtp_timestamp;
-    return streamer_push_video_frame(streamer, &frame);
-}
-
-/* 根据 INVITE Offer 生成最小可用的 SDP Answer 与媒体启动参数。 */
-static int sample_sdk_build_answer(sample_sdk_t *sdk,
-                                   const sip_invite_event_t *event,
-                                   sip_invite_response_t *response)
-{
-    const app_config_t *config = sdk->config;
-    streamer_sdp_plan_t plan;
-    int audio_accepted = 0;
-    int video_accepted = 0;
-
-    memset(&plan, 0, sizeof(plan));
-    memset(response, 0, sizeof(*response));
-
-    /* 音频仅在满足当前编码能力且端口有效时接受。 */
-    if (event->offer_audio_present) {
-        streamer_sdp_media_t *media = &plan.media[plan.media_count++];
-
-        memset(media, 0, sizeof(*media));
-        media->kind = STREAMER_MEDIA_AUDIO;
-        media->payload_type = event->offer_audio_payload_type != 0
-                                  ? event->offer_audio_payload_type
-                                  : default_audio_payload_type(config->audio_codec);
-        media->direction = STREAMER_DIRECTION_SENDRECV;
-        snprintf(media->transport, sizeof(media->transport), "%s", default_transport(event->offer_audio_transport));
-
-        if (config->audio_codec == AUDIO_CODEC_G711A && event->offer_audio_port != 0 && event->offer_audio_payload_type != 0) {
-            media->accepted = 1;
-            audio_accepted = 1;
-        }
-    }
-
-    /* 视频当前按 H264 透传协商。 */
-    if (event->offer_video_present) {
-        streamer_sdp_media_t *media = &plan.media[plan.media_count++];
-
-        memset(media, 0, sizeof(*media));
-        media->kind = STREAMER_MEDIA_VIDEO;
-        media->payload_type = event->offer_video_payload_type != 0 ? event->offer_video_payload_type : 96;
-        media->direction = STREAMER_DIRECTION_SENDRECV;
-        snprintf(media->transport, sizeof(media->transport), "%s", default_transport(event->offer_video_transport));
-
-        if (event->offer_video_port != 0 && event->offer_video_payload_type != 0) {
-            media->accepted = 1;
-            video_accepted = 1;
-        }
-    }
-
-    /* 如果音视频都无法接受，则明确返回 488。 */
-    if (!audio_accepted && !video_accepted) {
-        response->accept = 0;
-        response->status_code = 488;
-        snprintf(response->reason_phrase, sizeof(response->reason_phrase), "%s", "Not Acceptable Here");
-        return 0;
-    }
-
-    response->accept = 1;
-    response->send_ringing = 1;
-    response->status_code = 200;
-    snprintf(response->reason_phrase, sizeof(response->reason_phrase), "%s", "OK");
-    snprintf(response->media.remote_ip,
-             sizeof(response->media.remote_ip),
-             "%s",
-             event->offer_connection_ip != NULL && event->offer_connection_ip[0] != '\0'
-                 ? event->offer_connection_ip
-                 : event->source_ip);
-    response->media.remote_ip_alt[0] = '\0';
-    response->media.audio_port = audio_accepted ? event->offer_audio_port : 0;
-    response->media.video_port = video_accepted ? event->offer_video_port : 0;
-    response->media.audio_payload_type = audio_accepted ? event->offer_audio_payload_type : 0;
-    response->media.video_payload_type = video_accepted ? event->offer_video_payload_type : 0;
-    response->media.audio_codec = config->audio_codec;
-    response->media.video_enabled = video_accepted;
-    /* 当前仓库只保留上层主动送帧模式，streamer 内部不再回退到默认素材。 */
-    response->media.live_input_only = 1;
-
-    return streamer_build_sdp(event->streamer, &plan, response->answer_sdp, sizeof(response->answer_sdp));
-}
-
-/* 处理通用 SIP 事件，并维护当前会话对应的 streamer。 */
-static void sample_sdk_on_signal(const sip_signal_event_t *event, void *user_data)
-{
-    sample_sdk_t *sdk = (sample_sdk_t *) user_data;
-
-    if (event->type == SIP_SIGNAL_DIALOG_ESTABLISHED) {
-        sample_sdk_set_stream(sdk, event->streamer);
-    } else if (event->type == SIP_SIGNAL_DIALOG_TERMINATED) {
-        sample_sdk_set_stream(sdk, NULL);
-    }
-
-    if (event->type == SIP_SIGNAL_RESPONSE_SENT) {
-        fprintf(stdout,
-                "signal %s call_id=%s status=%d reason=%s\n",
-                signal_name(event->type),
-                event->call_id != NULL ? event->call_id : "-",
-                event->status_code,
-                event->reason_phrase != NULL ? event->reason_phrase : "-");
-        return;
-    }
-
-    fprintf(stdout,
-            "signal %s call_id=%s method=%s from=%s source=%s:%u\n",
-            signal_name(event->type),
-            event->call_id != NULL ? event->call_id : "-",
-            event->method != NULL ? event->method : "-",
-            event->from != NULL ? event->from : "-",
-            event->source_ip != NULL ? event->source_ip : "-",
-            event->source_port);
-}
-
-/* 打印对端 Offer 的核心信息，并委托生成应答。 */
-static int sample_sdk_on_invite(const sip_invite_event_t *event,
-                                sip_invite_response_t *response,
-                                void *user_data)
-{
-    sample_sdk_t *sdk = (sample_sdk_t *) user_data;
-
-    fprintf(stdout,
-            "invite offer ip=%s audio_present=%d audio_port=%u audio_pt=%u video_present=%d video_port=%u video_pt=%u\n",
-            event->offer_connection_ip != NULL ? event->offer_connection_ip : event->source_ip,
-            event->offer_audio_present,
-            event->offer_audio_port,
-            event->offer_audio_payload_type,
-            event->offer_video_present,
-            event->offer_video_port,
-            event->offer_video_payload_type);
-
-    return sample_sdk_build_answer(sdk, event, response);
-}
-
-/* 示例 RTP 接收回调：这里只做日志打印。 */
-static void sample_sdk_on_media(const streamer_rtp_packet_t *packet, void *user_data)
-{
-    (void) user_data;
-
-    fprintf(stdout,
-            "media rx kind=%s pt=%u seq=%u ts=%u size=%zu from=%s:%u\n",
-            packet->kind == STREAMER_MEDIA_AUDIO ? "audio" : "video",
-            packet->payload_type,
-            packet->sequence,
-            packet->timestamp,
-            packet->payload_size,
-            packet->source_ip != NULL ? packet->source_ip : "-",
-            packet->source_port);
+    return sip_embed_service_push_video_frame(host->service, access_unit, access_unit_size, rtp_timestamp);
 }
 
 /* 预加载本地测试媒体，供“上层主动推流”示例线程循环发送。 */
-static int sample_demo_media_load(sample_sdk_t *sdk)
+static int sample_demo_media_load(sample_host_t *host)
 {
-    sample_demo_media_t *demo_media = &sdk->demo_media;
+    sample_demo_media_t *demo_media = &host->demo_media;
 
-    if (read_entire_file(sdk->config->video_path, &demo_media->video_blob, &demo_media->video_blob_size) == 0) {
+    if (read_entire_file(host->config->video_path, &demo_media->video_blob, &demo_media->video_blob_size) == 0) {
         if (demo_build_h264_access_units(demo_media) != 0) {
-            fprintf(stderr, "failed to parse H264 access units from %s\n", sdk->config->video_path);
+            fprintf(stderr, "failed to parse H264 access units from %s\n", host->config->video_path);
             free(demo_media->video_blob);
             demo_media->video_blob = NULL;
             demo_media->video_blob_size = 0;
@@ -494,12 +266,12 @@ static int sample_demo_media_load(sample_sdk_t *sdk)
             demo_media->video_frame_count = 0;
         }
     } else {
-        fprintf(stderr, "failed to load video file: %s\n", sdk->config->video_path);
+        fprintf(stderr, "failed to load video file: %s\n", host->config->video_path);
     }
 
-    if (sdk->config->audio_codec == AUDIO_CODEC_G711A) {
-        if (read_entire_file(sdk->config->g711a_path, &demo_media->audio_blob, &demo_media->audio_blob_size) != 0) {
-            fprintf(stderr, "failed to load G711A file: %s\n", sdk->config->g711a_path);
+    if (host->config->audio_codec == AUDIO_CODEC_G711A) {
+        if (read_entire_file(host->config->g711a_path, &demo_media->audio_blob, &demo_media->audio_blob_size) != 0) {
+            fprintf(stderr, "failed to load G711A file: %s\n", host->config->g711a_path);
         }
     }
 
@@ -513,18 +285,18 @@ static int sample_demo_media_load(sample_sdk_t *sdk)
 /* 示例音频线程：按 20ms 节奏循环推送 G711A 数据。 */
 static void *sample_demo_audio_thread_main(void *opaque)
 {
-    sample_sdk_t *sdk = (sample_sdk_t *) opaque;
-    sample_demo_media_t *demo_media = &sdk->demo_media;
+    sample_host_t *host = (sample_host_t *) opaque;
+    sample_demo_media_t *demo_media = &host->demo_media;
     unsigned int generation = 0;
     size_t offset = 0;
     uint32_t timestamp = 0;
     int announced = 0;
 
     while (g_stop == 0) {
-        streamer_t *streamer;
+        int stream_active;
 
-        sample_sdk_get_stream(sdk, &streamer, &generation);
-        if (streamer == NULL || demo_media->audio_blob == NULL || demo_media->audio_blob_size == 0) {
+        sip_embed_service_get_stream_state(host->service, &stream_active, &generation);
+        if (!stream_active || demo_media->audio_blob == NULL || demo_media->audio_blob_size == 0) {
             announced = 0;
             sleep_ns(20000000LL);
             continue;
@@ -548,7 +320,7 @@ static void *sample_demo_audio_thread_main(void *opaque)
                 continue;
             }
 
-            if (sample_sdk_push_audio_frame(sdk, demo_media->audio_blob + offset, chunk, timestamp) == 0) {
+            if (sample_host_push_audio_frame(host, demo_media->audio_blob + offset, chunk, timestamp) == 0) {
                 offset += chunk;
                 timestamp += (uint32_t) chunk;
             }
@@ -558,10 +330,11 @@ static void *sample_demo_audio_thread_main(void *opaque)
         sleep_ns(20000000LL);
 
         {
-            streamer_t *current_streamer;
+            int current_stream_active;
             unsigned int current_generation;
 
-            sample_sdk_get_stream(sdk, &current_streamer, &current_generation);
+            sip_embed_service_get_stream_state(host->service, &current_stream_active, &current_generation);
+            (void) current_stream_active;
             if (current_generation != generation) {
                 offset = 0;
                 timestamp = 0;
@@ -576,13 +349,13 @@ static void *sample_demo_audio_thread_main(void *opaque)
 /* 示例视频线程：按配置帧率循环推送 H264 Access Unit。 */
 static void *sample_demo_video_thread_main(void *opaque)
 {
-    sample_sdk_t *sdk = (sample_sdk_t *) opaque;
-    sample_demo_media_t *demo_media = &sdk->demo_media;
+    sample_host_t *host = (sample_host_t *) opaque;
+    sample_demo_media_t *demo_media = &host->demo_media;
     unsigned int generation = 0;
     size_t frame_index = 0;
     uint32_t timestamp = 0;
-    long long frame_interval_ns = (long long) (1000000000.0 / sdk->config->video_fps);
-    uint32_t timestamp_step = (uint32_t) (90000.0 / sdk->config->video_fps);
+    long long frame_interval_ns = (long long) (1000000000.0 / host->config->video_fps);
+    uint32_t timestamp_step = (uint32_t) (90000.0 / host->config->video_fps);
     int announced = 0;
 
     if (frame_interval_ns <= 0) {
@@ -593,10 +366,10 @@ static void *sample_demo_video_thread_main(void *opaque)
     }
 
     while (g_stop == 0) {
-        streamer_t *streamer;
+        int stream_active;
 
-        sample_sdk_get_stream(sdk, &streamer, &generation);
-        if (streamer == NULL || demo_media->video_frames == NULL || demo_media->video_frame_count == 0) {
+        sip_embed_service_get_stream_state(host->service, &stream_active, &generation);
+        if (!stream_active || demo_media->video_frames == NULL || demo_media->video_frame_count == 0) {
             announced = 0;
             sleep_ns(10000000LL);
             continue;
@@ -614,10 +387,8 @@ static void *sample_demo_video_thread_main(void *opaque)
         {
             const h264_access_unit_t *access_unit = &demo_media->video_frames[frame_index];
 
-            if (sample_sdk_push_video_frame(sdk,
-                                            demo_media->video_blob + access_unit->offset,
-                                            access_unit->size,
-                                            timestamp) == 0) {
+            if (sample_host_push_video_frame(host, demo_media->video_blob + access_unit->offset, access_unit->size, timestamp) ==
+                0) {
                 ++frame_index;
                 timestamp += timestamp_step;
             }
@@ -627,10 +398,11 @@ static void *sample_demo_video_thread_main(void *opaque)
         sleep_ns(frame_interval_ns);
 
         {
-            streamer_t *current_streamer;
+            int current_stream_active;
             unsigned int current_generation;
 
-            sample_sdk_get_stream(sdk, &current_streamer, &current_generation);
+            sip_embed_service_get_stream_state(host->service, &current_stream_active, &current_generation);
+            (void) current_stream_active;
             if (current_generation != generation) {
                 frame_index = 0;
                 timestamp = 0;
@@ -643,12 +415,12 @@ static void *sample_demo_video_thread_main(void *opaque)
 }
 
 /* 启动示例音视频推流线程。 */
-static int sample_demo_media_start(sample_sdk_t *sdk)
+static int sample_demo_media_start(sample_host_t *host)
 {
-    sample_demo_media_t *demo_media = &sdk->demo_media;
+    sample_demo_media_t *demo_media = &host->demo_media;
 
     if (demo_media->audio_blob != NULL && demo_media->audio_blob_size > 0) {
-        if (pthread_create(&demo_media->audio_thread, NULL, sample_demo_audio_thread_main, sdk) != 0) {
+        if (pthread_create(&demo_media->audio_thread, NULL, sample_demo_audio_thread_main, host) != 0) {
             perror("pthread_create(audio-push)");
             return -1;
         }
@@ -656,7 +428,7 @@ static int sample_demo_media_start(sample_sdk_t *sdk)
     }
 
     if (demo_media->video_frames != NULL && demo_media->video_frame_count > 0) {
-        if (pthread_create(&demo_media->video_thread, NULL, sample_demo_video_thread_main, sdk) != 0) {
+        if (pthread_create(&demo_media->video_thread, NULL, sample_demo_video_thread_main, host) != 0) {
             perror("pthread_create(video-push)");
             g_stop = 1;
             if (demo_media->audio_thread_running) {
@@ -672,9 +444,9 @@ static int sample_demo_media_start(sample_sdk_t *sdk)
 }
 
 /* 等待示例推流线程退出。 */
-static void sample_demo_media_stop(sample_sdk_t *sdk)
+static void sample_demo_media_stop(sample_host_t *host)
 {
-    sample_demo_media_t *demo_media = &sdk->demo_media;
+    sample_demo_media_t *demo_media = &host->demo_media;
 
     if (demo_media->audio_thread_running) {
         pthread_join(demo_media->audio_thread, NULL);
@@ -687,36 +459,30 @@ static void sample_demo_media_stop(sample_sdk_t *sdk)
 }
 
 /* 释放 SDK 上下文持有的线程、媒体缓存与互斥锁。 */
-static void sample_sdk_destroy(sample_sdk_t *sdk)
+static void sample_host_destroy(sample_host_t *host)
 {
-    sample_demo_media_t *demo_media = &sdk->demo_media;
+    sample_demo_media_t *demo_media = &host->demo_media;
 
-    sample_sdk_set_stream(sdk, NULL);
-    sample_demo_media_stop(sdk);
+    sample_demo_media_stop(host);
     free(demo_media->video_frames);
     free(demo_media->video_blob);
     free(demo_media->audio_blob);
-    pthread_mutex_destroy(&sdk->mutex);
 }
 
-/* 初始化示例 SDK，并固定启动上层推流演示线程。 */
-static int sample_sdk_init(sample_sdk_t *sdk, const app_config_t *config)
+/* 初始化示例宿主，并启动本地演示推流线程。 */
+static int sample_host_init(sample_host_t *host, const app_config_t *config, sip_embed_service_t *service)
 {
-    memset(sdk, 0, sizeof(*sdk));
-    sdk->config = config;
+    memset(host, 0, sizeof(*host));
+    host->config = config;
+    host->service = service;
 
-    if (pthread_mutex_init(&sdk->mutex, NULL) != 0) {
-        perror("pthread_mutex_init");
+    if (sample_demo_media_load(host) != 0) {
+        sample_host_destroy(host);
         return -1;
     }
 
-    if (sample_demo_media_load(sdk) != 0) {
-        sample_sdk_destroy(sdk);
-        return -1;
-    }
-
-    if (sample_demo_media_start(sdk) != 0) {
-        sample_sdk_destroy(sdk);
+    if (sample_demo_media_start(host) != 0) {
+        sample_host_destroy(host);
         return -1;
     }
 
@@ -726,8 +492,8 @@ static int sample_sdk_init(sample_sdk_t *sdk, const app_config_t *config)
 int main(int argc, char **argv)
 {
     app_config_t config;
-    sample_sdk_t sdk;
-    sip_server_handlers_t handlers;
+    sample_host_t host;
+    sip_embed_service_t *service;
     int parse_rc;
     int run_rc;
 
@@ -743,16 +509,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (sample_sdk_init(&sdk, &config) != 0) {
+    service = sip_embed_service_create(&config);
+    if (service == NULL) {
         return 1;
     }
 
-    /* 这里演示上层如何注册 SIP/媒体回调并接管会话。 */
-    memset(&handlers, 0, sizeof(handlers));
-    handlers.on_signal = sample_sdk_on_signal;
-    handlers.on_invite = sample_sdk_on_invite;
-    handlers.on_media = sample_sdk_on_media;
-    handlers.user_data = &sdk;
+    if (sample_host_init(&host, &config, service) != 0) {
+        sip_embed_service_destroy(service);
+        return 1;
+    }
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -764,9 +529,9 @@ int main(int argc, char **argv)
             config.media_ip,
             config_audio_codec_name(config.audio_codec));
 
-    /* 核心入口仍然是带 handlers 的运行函数。 */
-    run_rc = sip_server_run_with_handlers(&config, &g_stop, &handlers);
+    run_rc = sip_embed_service_run(service, &g_stop);
     g_stop = 1;
-    sample_sdk_destroy(&sdk);
+    sample_host_destroy(&host);
+    sip_embed_service_destroy(service);
     return run_rc;
 }
