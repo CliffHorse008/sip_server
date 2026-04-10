@@ -103,11 +103,6 @@ echo "input  : $INPUT_FILE"
 echo "output : $OUTPUT_DIR"
 echo "fps    : $VIDEO_FPS"
 
-INPUT_DURATION="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$INPUT_FILE")"
-if [[ -z "$INPUT_DURATION" ]]; then
-  INPUT_DURATION="10"
-fi
-
 # 这里不再直接 copy 视频流，而是转成固定帧率、无 B 帧、带 AUD 的 H264。
 # 当前 demo 发送器按固定 video_fps 节奏送帧；如果源视频是 VFR 或带 B 帧，直接抽裸流会更容易出现 Linphone 端跳帧。
 ffmpeg -y -i "$INPUT_FILE" \
@@ -135,24 +130,13 @@ ffmpeg -y -i "$INPUT_FILE" \
   -f adts \
   "$OUTPUT_DIR/audio.aac"
 
-SOURCE_MAX_VOLUME="$(ffmpeg -hide_banner -i "$INPUT_FILE" -vn -af volumedetect -f null - 2>&1 | awk -F': ' '/max_volume/ {print $2}' | tail -n 1 || true)"
-if [[ -n "$SOURCE_MAX_VOLUME" && "$SOURCE_MAX_VOLUME" != "-91.0 dB" ]]; then
-  ffmpeg -y -i "$INPUT_FILE" \
-    -vn \
-    -ac 1 \
-    -ar 8000 \
-    -c:a pcm_alaw \
-    -f alaw \
-    "$OUTPUT_DIR/audio.g711a"
-else
-  echo "source audio is silent, generating 440Hz test tone for G711A"
-  ffmpeg -y \
-    -f lavfi -i "sine=frequency=440:sample_rate=8000:duration=${INPUT_DURATION}" \
-    -ac 1 \
-    -c:a pcm_alaw \
-    -f alaw \
-    "$OUTPUT_DIR/audio.g711a"
-fi
+ffmpeg -y -i "$INPUT_FILE" \
+  -vn \
+  -ac 1 \
+  -ar 8000 \
+  -c:a pcm_alaw \
+  -f alaw \
+  "$OUTPUT_DIR/audio.g711a"
 
 echo "generated:"
 ls -lh "$OUTPUT_DIR"

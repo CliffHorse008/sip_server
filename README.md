@@ -112,7 +112,7 @@ chmod +x scripts/prepare_media.sh
 - `video.h264` 会被标准化成固定帧率、`yuv420p`、无 B 帧、带 AUD 的 H264，便于当前 demo 发送器按固定节奏送帧
 - `audio.aac` 会转成 ADTS 格式 AAC
 - `audio.g711a` 为 8kHz/mono 原始 A-law 负载
-- 如果源文件音轨本身是静音，脚本会自动为 `audio.g711a` 生成 440Hz 测试音，便于联调
+- 如果源文件音轨本身是静音，转换后的 `audio.g711a` 也会保持静音，不再额外生成测试音
 - 如果你用 `-r/--video-fps` 指定了别的输出帧率，运行示例程序时也建议同步设置 `--video-fps`，保持发送节奏一致
 
 ## 编译
