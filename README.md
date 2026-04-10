@@ -1,13 +1,13 @@
 # Minimal SIP Server
 
-一个最小可编译的 SIP Server/RTP 发送/接收框架，使用 C 开发、CMake 构建，不依赖第三方运行库。工程目标是：
+一个最小可编译的 SIP Server/RTP 发送/接收框架，使用 C 开发、CMake 构建，不依赖第三方运行库。当前仓库只保留“上层推流演示”这一种运行方式。工程目标是：
 
 - SIP 信令走 UDP，默认监听 `5060`
 - 媒体传输走 UDP/RTP
 - 视频支持 H264
 - 音频支持 AAC 和 G711A
 - 测试素材来自当前目录的 `dlc_video.mp4`
-- `ffmpeg` 仅用于离线生成测试码流，和 `sipserver` 运行时完全解耦
+- `ffmpeg` 仅用于离线生成演示用测试码流，和 `sipserver` 运行时完全解耦
 
 ## 目录结构
 
@@ -24,12 +24,12 @@
 
 ## 功能边界
 
-当前实现是“最小框架”，重点在工程骨架、媒体发送链路和 RTP 回调接入点：
+当前实现是“最小框架”，重点在工程骨架、上层送帧链路和 RTP 回调接入点：
 
 - 支持 SIP UDP 基础方法：`OPTIONS`、`REGISTER`、`INVITE`、`ACK`、`BYE`
 - 收到 `INVITE` 后解析对端 SDP 中的 `m=`、`rtpmap`、`fmtp`、方向属性和 RTP 端口
-- 默认模式下会按 Offer 生成最小可用的 SDP Answer，并沿用对端的 payload type
-- 收到 `ACK` 后启动音视频 RTP 发送线程
+- 会按 Offer 生成最小可用的 SDP Answer，并沿用对端的 payload type
+- 收到 `ACK` 后启动音视频 RTP 发送线程，等待上层持续送帧
 - 支持上层透传关键 SIP 事件
 - 支持上层决定是否接听、返回码、Reason 和完整 SDP Answer
 - 支持上层通过线程安全接口实时推送音频帧和视频帧
@@ -148,9 +148,9 @@ sip:test@192.168.18.126:6060;transport=udp
 
 服务端会根据 Offer 中的 IP/端口发送 RTP；在本机或 WSL 联调场景下，也会同时尝试向 `ACK` 的源地址发送 RTP，以规避客户端宣告地址和实际可达地址不一致的问题。
 
-## 上层接管模式
+## 上层推流演示
 
-当前仓库里的 `main` 已经整理成“上层 SDK 接入示例”。
+当前仓库里的 `main` 已经整理成“上层 SDK 接入示例”，也是现在唯一保留的运行方式。
 它不是简单地直接调用 `sip_server_run()`，而是演示了上层怎样做这几件事：
 
 - 保存当前会话对应的 `streamer_t *`
@@ -165,13 +165,14 @@ sip:test@192.168.18.126:6060;transport=udp
 return sip_server_run(&config, &g_stop);
 ```
 
-当前 `main` 有两种运行方式：
+当前 `main` 的运行方式已经固定为上层推流演示：
 
-- 默认模式：
-  上层仍然接管 SIP 信令和 SDP Answer，但媒体发送继续走 `streamer` 内部测试素材，优先保证 Linphone 联调稳定
-- 推流演示模式：
-  设置环境变量 `SIPSERVER_UPPER_PUSH_DEMO=1` 后，`main.c` 会额外启动两个示例线程，模拟上层持续调用 `streamer_push_audio_frame()` 和 `streamer_push_video_frame()` 喂流
-  该模式下会把 `response->media.live_input_only` 置为 `1`，媒体只来自上层输入，不再回退到内部素材发送
+当前行为：
+
+- `main.c` 启动后会固定进入上层推流演示流程
+- 会启动两个示例线程，模拟上层持续调用 `streamer_push_audio_frame()` 和 `streamer_push_video_frame()` 喂流
+- `response->media.live_input_only` 固定置为 `1`
+- `streamer` 内部不再加载或回退到默认测试素材发送；媒体完全来自上层输入队列
 
 入口仍然是：
 
@@ -253,7 +254,7 @@ streamer_push_video_frame(current_streamer, &video_frame);
 
 - 当前回调拿到的是原始 RTP payload，不是解码后的 PCM/YUV
 - 发送线程和接收回调复用本地 RTP 端口
-- `sip_server_run()` 仍然保留默认 SDP 协商逻辑；只有 `sip_server_run_with_handlers()` 才是上层完全接管模式
+- `sip_server_run()` 仍然保留默认 SDP 协商逻辑；当前仓库示例入口使用的是 `sip_server_run_with_handlers()`
 - 当前 `main.c` 示例默认按 `G711A + H264` 思路接管协商；如果你切到 `--audio-codec aac`，还需要在你的上层里补 AAC 的 Offer 解析和接听策略
 - 如果你要接自己的 SDK，最直接的做法就是保留 `sample_sdk_on_signal()` / `sample_sdk_on_invite()` 这类回调骨架，把 demo 线程替换成你自己的采集或转发线程
 

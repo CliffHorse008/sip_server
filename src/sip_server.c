@@ -43,6 +43,8 @@ typedef struct {
     char from[1024];
     char to[1024];
     char via[1024];
+    char source_ip[64];
+    uint16_t source_port;
     int cseq;
     char cseq_method[16];
     char local_tag[32];
@@ -813,6 +815,19 @@ static int dialog_matches(const sip_dialog_t *dialog, const sip_request_t *reque
            request_has_local_tag(request, dialog->local_tag);
 }
 
+static int dialog_matches_relaxed(const sip_dialog_t *dialog, const sip_request_t *request)
+{
+    return dialog->active &&
+           strcmp(dialog->call_id, request->call_id) == 0 &&
+           dialog->source_port == request->source_port &&
+           strcmp(dialog->source_ip, request->source_ip) == 0;
+}
+
+static int dialog_matches_for_termination(const sip_dialog_t *dialog, const sip_request_t *request)
+{
+    return dialog_matches(dialog, request) || dialog_matches_relaxed(dialog, request);
+}
+
 static int dialog_conflicts_with_new_invite(const sip_dialog_t *dialog, const sip_request_t *request)
 {
     return dialog->active && !dialog_matches(dialog, request);
@@ -976,6 +991,8 @@ static void dialog_init_from_request(sip_dialog_t *dialog, const sip_request_t *
     snprintf(dialog->from, sizeof(dialog->from), "%s", request->from);
     snprintf(dialog->to, sizeof(dialog->to), "%s", request->to);
     snprintf(dialog->via, sizeof(dialog->via), "%s", request->via);
+    snprintf(dialog->source_ip, sizeof(dialog->source_ip), "%s", request->source_ip);
+    dialog->source_port = request->source_port;
     dialog->cseq = request->cseq;
     snprintf(dialog->cseq_method, sizeof(dialog->cseq_method), "%s", request->cseq_method);
 }
@@ -1413,7 +1430,7 @@ int sip_server_run_with_handlers(const app_config_t *config,
                 continue;
             }
 
-            if (str_case_equal(request.method, "BYE") && !dialog_matches(&dialog, &request)) {
+            if (str_case_equal(request.method, "BYE") && !dialog_matches_for_termination(&dialog, &request)) {
                 matched_terminated_bye =
                     terminated_dialog_find_match(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, &request);
                 duplicate_bye_after_termination = matched_terminated_bye != NULL;
@@ -1728,7 +1745,14 @@ int sip_server_run_with_handlers(const app_config_t *config,
                     }
                 }
             } else if (str_case_equal(request.method, "BYE")) {
-                if (dialog_matches(&dialog, &request)) {
+                if (dialog_matches_for_termination(&dialog, &request)) {
+                    if (!dialog_matches(&dialog, &request)) {
+                        fprintf(stdout,
+                                "BYE matched active dialog by relaxed identity call_id=%s source=%s:%u\n",
+                                request.call_id,
+                                request.source_ip,
+                                request.source_port);
+                    }
                     emit_signal_event(handlers, streamer, SIP_SIGNAL_BYE_RECEIVED, &request, NULL, 0, NULL, request.body);
                     streamer_stop(streamer);
                     send_response_and_emit(sip_socket,

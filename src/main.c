@@ -40,7 +40,6 @@ typedef struct {
     pthread_mutex_t mutex;
     streamer_t *streamer;
     unsigned int stream_generation;
-    int enable_demo_source;
     sample_demo_media_t demo_media;
 } sample_sdk_t;
 
@@ -101,15 +100,6 @@ static uint8_t default_audio_payload_type(audio_codec_t codec)
 static const char *default_transport(const char *transport)
 {
     return transport != NULL && transport[0] != '\0' ? transport : "RTP/AVP";
-}
-
-/* 读取形如 1/true/TRUE 的环境变量开关。 */
-static int env_flag_enabled(const char *name)
-{
-    const char *value = getenv(name);
-
-    return value != NULL &&
-           (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0);
 }
 
 /* 一次性把整个文件读入内存，用于测试媒体加载。 */
@@ -415,7 +405,8 @@ static int sample_sdk_build_answer(sample_sdk_t *sdk,
     response->media.video_payload_type = video_accepted ? event->offer_video_payload_type : 0;
     response->media.audio_codec = config->audio_codec;
     response->media.video_enabled = video_accepted;
-    response->media.live_input_only = sdk->enable_demo_source;
+    /* 当前仓库只保留上层主动送帧模式，streamer 内部不再回退到默认素材。 */
+    response->media.live_input_only = 1;
 
     return streamer_build_sdp(event->streamer, &plan, response->answer_sdp, sizeof(response->answer_sdp));
 }
@@ -491,10 +482,6 @@ static void sample_sdk_on_media(const streamer_rtp_packet_t *packet, void *user_
 static int sample_demo_media_load(sample_sdk_t *sdk)
 {
     sample_demo_media_t *demo_media = &sdk->demo_media;
-
-    if (!sdk->enable_demo_source) {
-        return 0;
-    }
 
     if (read_entire_file(sdk->config->video_path, &demo_media->video_blob, &demo_media->video_blob_size) == 0) {
         if (demo_build_h264_access_units(demo_media) != 0) {
@@ -712,12 +699,11 @@ static void sample_sdk_destroy(sample_sdk_t *sdk)
     pthread_mutex_destroy(&sdk->mutex);
 }
 
-/* 初始化示例 SDK，并按环境变量决定是否启动上层推流演示。 */
+/* 初始化示例 SDK，并固定启动上层推流演示线程。 */
 static int sample_sdk_init(sample_sdk_t *sdk, const app_config_t *config)
 {
     memset(sdk, 0, sizeof(*sdk));
     sdk->config = config;
-    sdk->enable_demo_source = env_flag_enabled("SIPSERVER_UPPER_PUSH_DEMO");
 
     if (pthread_mutex_init(&sdk->mutex, NULL) != 0) {
         perror("pthread_mutex_init");
@@ -729,7 +715,7 @@ static int sample_sdk_init(sample_sdk_t *sdk, const app_config_t *config)
         return -1;
     }
 
-    if (sdk->enable_demo_source && sample_demo_media_start(sdk) != 0) {
+    if (sample_demo_media_start(sdk) != 0) {
         sample_sdk_destroy(sdk);
         return -1;
     }
@@ -772,12 +758,11 @@ int main(int argc, char **argv)
     signal(SIGTERM, handle_signal);
 
     fprintf(stdout,
-            "sipserver starting on %s:%u, media=%s, audio_codec=%s, upper_push_demo=%s\n",
+            "sipserver starting on %s:%u, media=%s, audio_codec=%s, mode=upper-push-demo\n",
             config.bind_ip,
             config.sip_port,
             config.media_ip,
-            config_audio_codec_name(config.audio_codec),
-            sdk.enable_demo_source ? "on" : "off");
+            config_audio_codec_name(config.audio_codec));
 
     /* 核心入口仍然是带 handlers 的运行函数。 */
     run_rc = sip_server_run_with_handlers(&config, &g_stop, &handlers);
