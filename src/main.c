@@ -9,15 +9,18 @@
 #include "config.h"
 #include "sip_server.h"
 
+/* G711A 在 8kHz 下每 20ms 对应 160 个采样。 */
 #define G711A_SAMPLES_PER_PACKET 160U
 
 static volatile sig_atomic_t g_stop = 0;
 
+/* 一个 H264 Access Unit 在裸码流中的偏移与长度。 */
 typedef struct {
     size_t offset;
     size_t size;
 } h264_access_unit_t;
 
+/* 示例推流线程需要的测试媒体缓存。 */
 typedef struct {
     unsigned char *video_blob;
     size_t video_blob_size;
@@ -31,6 +34,7 @@ typedef struct {
     int video_thread_running;
 } sample_demo_media_t;
 
+/* 模拟上层 SDK 的上下文，保存当前会话与示例媒体状态。 */
 typedef struct {
     const app_config_t *config;
     pthread_mutex_t mutex;
@@ -40,12 +44,14 @@ typedef struct {
     sample_demo_media_t demo_media;
 } sample_sdk_t;
 
+/* 捕获退出信号，让主循环和工作线程尽快收敛。 */
 static void handle_signal(int signum)
 {
     (void) signum;
     g_stop = 1;
 }
 
+/* 用纳秒粒度休眠，并在收到退出信号时提前结束。 */
 static void sleep_ns(long long nanoseconds)
 {
     struct timespec ts;
@@ -60,6 +66,7 @@ static void sleep_ns(long long nanoseconds)
     }
 }
 
+/* 将内部信令枚举转换为日志可读字符串。 */
 static const char *signal_name(sip_signal_type_t type)
 {
     switch (type) {
@@ -84,16 +91,19 @@ static const char *signal_name(sip_signal_type_t type)
     }
 }
 
+/* 未指定 payload type 时，给音频协商一个默认值。 */
 static uint8_t default_audio_payload_type(audio_codec_t codec)
 {
     return codec == AUDIO_CODEC_G711A ? 8 : 97;
 }
 
+/* 对端未声明传输协议时，退回最常见的 RTP/AVP。 */
 static const char *default_transport(const char *transport)
 {
     return transport != NULL && transport[0] != '\0' ? transport : "RTP/AVP";
 }
 
+/* 读取形如 1/true/TRUE 的环境变量开关。 */
 static int env_flag_enabled(const char *name)
 {
     const char *value = getenv(name);
@@ -102,6 +112,7 @@ static int env_flag_enabled(const char *name)
            (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0);
 }
 
+/* 一次性把整个文件读入内存，用于测试媒体加载。 */
 static int read_entire_file(const char *path, unsigned char **buffer, size_t *size)
 {
     FILE *stream;
@@ -150,6 +161,7 @@ static int read_entire_file(const char *path, unsigned char **buffer, size_t *si
     return 0;
 }
 
+/* 在 Annex-B H264 码流中查找起始码位置。 */
 static int find_start_code(const unsigned char *data,
                            size_t size,
                            size_t offset,
@@ -180,6 +192,7 @@ static int find_start_code(const unsigned char *data,
     return 0;
 }
 
+/* 追加一个 Access Unit 的区间记录。 */
 static int demo_append_h264_access_unit(sample_demo_media_t *demo_media, size_t offset, size_t size)
 {
     h264_access_unit_t *grown;
@@ -202,6 +215,7 @@ static int demo_append_h264_access_unit(sample_demo_media_t *demo_media, size_t 
     return 0;
 }
 
+/* 通过 AUD 或起始 NAL 边界，把裸 H264 拆成逐帧发送的 Access Unit。 */
 static int demo_build_h264_access_units(sample_demo_media_t *demo_media)
 {
     size_t current_offset = 0;
@@ -267,6 +281,7 @@ static int demo_build_h264_access_units(sample_demo_media_t *demo_media)
     return demo_media->video_frame_count > 0 ? 0 : -1;
 }
 
+/* 线程安全地读取当前生效的 streamer 及其代数。 */
 static void sample_sdk_get_stream(sample_sdk_t *sdk, streamer_t **streamer, unsigned int *generation)
 {
     pthread_mutex_lock(&sdk->mutex);
@@ -275,6 +290,7 @@ static void sample_sdk_get_stream(sample_sdk_t *sdk, streamer_t **streamer, unsi
     pthread_mutex_unlock(&sdk->mutex);
 }
 
+/* 在会话建立/结束时更新当前 streamer，并推进代数。 */
 static void sample_sdk_set_stream(sample_sdk_t *sdk, streamer_t *streamer)
 {
     pthread_mutex_lock(&sdk->mutex);
@@ -283,6 +299,7 @@ static void sample_sdk_set_stream(sample_sdk_t *sdk, streamer_t *streamer)
     pthread_mutex_unlock(&sdk->mutex);
 }
 
+/* 由示例线程向当前会话投递一帧音频。 */
 static int sample_sdk_push_audio_frame(sample_sdk_t *sdk,
                                        const uint8_t *payload,
                                        size_t payload_size,
@@ -304,6 +321,7 @@ static int sample_sdk_push_audio_frame(sample_sdk_t *sdk,
     return streamer_push_audio_frame(streamer, &frame);
 }
 
+/* 由示例线程向当前会话投递一帧视频。 */
 static int sample_sdk_push_video_frame(sample_sdk_t *sdk,
                                        const uint8_t *access_unit,
                                        size_t access_unit_size,
@@ -325,6 +343,7 @@ static int sample_sdk_push_video_frame(sample_sdk_t *sdk,
     return streamer_push_video_frame(streamer, &frame);
 }
 
+/* 根据 INVITE Offer 生成最小可用的 SDP Answer 与媒体启动参数。 */
 static int sample_sdk_build_answer(sample_sdk_t *sdk,
                                    const sip_invite_event_t *event,
                                    sip_invite_response_t *response)
@@ -337,6 +356,7 @@ static int sample_sdk_build_answer(sample_sdk_t *sdk,
     memset(&plan, 0, sizeof(plan));
     memset(response, 0, sizeof(*response));
 
+    /* 音频仅在满足当前编码能力且端口有效时接受。 */
     if (event->offer_audio_present) {
         streamer_sdp_media_t *media = &plan.media[plan.media_count++];
 
@@ -354,6 +374,7 @@ static int sample_sdk_build_answer(sample_sdk_t *sdk,
         }
     }
 
+    /* 视频当前按 H264 透传协商。 */
     if (event->offer_video_present) {
         streamer_sdp_media_t *media = &plan.media[plan.media_count++];
 
@@ -369,6 +390,7 @@ static int sample_sdk_build_answer(sample_sdk_t *sdk,
         }
     }
 
+    /* 如果音视频都无法接受，则明确返回 488。 */
     if (!audio_accepted && !video_accepted) {
         response->accept = 0;
         response->status_code = 488;
@@ -398,6 +420,7 @@ static int sample_sdk_build_answer(sample_sdk_t *sdk,
     return streamer_build_sdp(event->streamer, &plan, response->answer_sdp, sizeof(response->answer_sdp));
 }
 
+/* 处理通用 SIP 事件，并维护当前会话对应的 streamer。 */
 static void sample_sdk_on_signal(const sip_signal_event_t *event, void *user_data)
 {
     sample_sdk_t *sdk = (sample_sdk_t *) user_data;
@@ -428,6 +451,7 @@ static void sample_sdk_on_signal(const sip_signal_event_t *event, void *user_dat
             event->source_port);
 }
 
+/* 打印对端 Offer 的核心信息，并委托生成应答。 */
 static int sample_sdk_on_invite(const sip_invite_event_t *event,
                                 sip_invite_response_t *response,
                                 void *user_data)
@@ -447,6 +471,7 @@ static int sample_sdk_on_invite(const sip_invite_event_t *event,
     return sample_sdk_build_answer(sdk, event, response);
 }
 
+/* 示例 RTP 接收回调：这里只做日志打印。 */
 static void sample_sdk_on_media(const streamer_rtp_packet_t *packet, void *user_data)
 {
     (void) user_data;
@@ -462,6 +487,7 @@ static void sample_sdk_on_media(const streamer_rtp_packet_t *packet, void *user_
             packet->source_port);
 }
 
+/* 预加载本地测试媒体，供“上层主动推流”示例线程循环发送。 */
 static int sample_demo_media_load(sample_sdk_t *sdk)
 {
     sample_demo_media_t *demo_media = &sdk->demo_media;
@@ -497,6 +523,7 @@ static int sample_demo_media_load(sample_sdk_t *sdk)
     return 0;
 }
 
+/* 示例音频线程：按 20ms 节奏循环推送 G711A 数据。 */
 static void *sample_demo_audio_thread_main(void *opaque)
 {
     sample_sdk_t *sdk = (sample_sdk_t *) opaque;
@@ -540,6 +567,7 @@ static void *sample_demo_audio_thread_main(void *opaque)
             }
         }
 
+        /* 如果会话已经切换，则从头开始重新送帧。 */
         sleep_ns(20000000LL);
 
         {
@@ -558,6 +586,7 @@ static void *sample_demo_audio_thread_main(void *opaque)
     return NULL;
 }
 
+/* 示例视频线程：按配置帧率循环推送 H264 Access Unit。 */
 static void *sample_demo_video_thread_main(void *opaque)
 {
     sample_sdk_t *sdk = (sample_sdk_t *) opaque;
@@ -607,6 +636,7 @@ static void *sample_demo_video_thread_main(void *opaque)
             }
         }
 
+        /* streamer 发生切换后，视频时间线也要同步重置。 */
         sleep_ns(frame_interval_ns);
 
         {
@@ -625,6 +655,7 @@ static void *sample_demo_video_thread_main(void *opaque)
     return NULL;
 }
 
+/* 启动示例音视频推流线程。 */
 static int sample_demo_media_start(sample_sdk_t *sdk)
 {
     sample_demo_media_t *demo_media = &sdk->demo_media;
@@ -653,6 +684,7 @@ static int sample_demo_media_start(sample_sdk_t *sdk)
     return 0;
 }
 
+/* 等待示例推流线程退出。 */
 static void sample_demo_media_stop(sample_sdk_t *sdk)
 {
     sample_demo_media_t *demo_media = &sdk->demo_media;
@@ -667,6 +699,7 @@ static void sample_demo_media_stop(sample_sdk_t *sdk)
     }
 }
 
+/* 释放 SDK 上下文持有的线程、媒体缓存与互斥锁。 */
 static void sample_sdk_destroy(sample_sdk_t *sdk)
 {
     sample_demo_media_t *demo_media = &sdk->demo_media;
@@ -679,6 +712,7 @@ static void sample_sdk_destroy(sample_sdk_t *sdk)
     pthread_mutex_destroy(&sdk->mutex);
 }
 
+/* 初始化示例 SDK，并按环境变量决定是否启动上层推流演示。 */
 static int sample_sdk_init(sample_sdk_t *sdk, const app_config_t *config)
 {
     memset(sdk, 0, sizeof(*sdk));
@@ -713,6 +747,7 @@ int main(int argc, char **argv)
 
     srand((unsigned int) time(NULL));
 
+    /* 先解析命令行；帮助信息与参数错误在这里直接返回。 */
     parse_rc = config_parse(&config, argc, argv);
     if (parse_rc > 0) {
         return 0;
@@ -726,6 +761,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* 这里演示上层如何注册 SIP/媒体回调并接管会话。 */
     memset(&handlers, 0, sizeof(handlers));
     handlers.on_signal = sample_sdk_on_signal;
     handlers.on_invite = sample_sdk_on_invite;
@@ -743,6 +779,7 @@ int main(int argc, char **argv)
             config_audio_codec_name(config.audio_codec),
             sdk.enable_demo_source ? "on" : "off");
 
+    /* 核心入口仍然是带 handlers 的运行函数。 */
     run_rc = sip_server_run_with_handlers(&config, &g_stop, &handlers);
     g_stop = 1;
     sample_sdk_destroy(&sdk);
