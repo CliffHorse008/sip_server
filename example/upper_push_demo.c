@@ -6,8 +6,8 @@
 #include <string.h>
 #include <time.h>
 
-#include "config.h"
-#include "sip_embed.h"
+#include "sipserver/config.h"
+#include "sipserver/sip_embed.h"
 
 /* G711A 在 8kHz 下每 20ms 对应 160 个采样。 */
 #define G711A_SAMPLES_PER_PACKET 160U

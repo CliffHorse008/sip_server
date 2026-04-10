@@ -1,4 +1,4 @@
-#include "sip_server.h"
+#include "sipserver/sip_server.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -11,8 +11,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#include "net.h"
-#include "streamer.h"
+#include "internal/net.h"
 
 #define SIP_BUFFER_SIZE 8192
 #define SDP_MAX_PAYLOADS 16

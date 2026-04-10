@@ -16,16 +16,23 @@
 ├── CMakeLists.txt
 ├── README.md
 ├── include/
-│   ├── config.h
-│   ├── sip_embed.h
-│   ├── sip_server.h
-│   └── streamer.h
+│   └── sipserver/
+│       ├── config.h
+│       ├── sip_embed.h
+│       ├── sip_session.h
+│       ├── sip_server.h
+│       └── streamer.h
 ├── scripts/
 │   └── prepare_media.sh
+├── example/
+│   └── upper_push_demo.c
 ├── src/
+│   ├── internal/
+│   │   └── net.h
 │   ├── config.c
-│   ├── main.c
+│   ├── net.c
 │   ├── sip_embed.c
+│   ├── sip_session.c
 │   ├── sip_server.c
 │   └── streamer.c
 └── test_media/
@@ -33,11 +40,14 @@
 
 当前代码已经按职责拆成几层：
 
-- 配置层：`config.h` / `config.c`
-- 媒体层：`streamer.h` / `streamer.c`
-- SIP 会话层：`sip_server.h` / `sip_server.c`
-- 嵌入式接入层：`sip_embed.h` / `sip_embed.c`
-- 示例宿主：`main.c`
+- 对外头文件：`include/sipserver/*.h`
+- 对内头文件：`src/internal/*.h`
+- 配置层：`include/sipserver/config.h` / `src/config.c`
+- 媒体层：`include/sipserver/streamer.h` / `src/streamer.c`
+- SIP 协议层：`include/sipserver/sip_server.h` / `src/sip_server.c`
+- SIP 会话层：`include/sipserver/sip_session.h` / `src/sip_session.c`
+- 嵌入式接入层：`include/sipserver/sip_embed.h` / `src/sip_embed.c`
+- 示例宿主：`example/upper_push_demo.c`
 
 ## 功能边界
 
@@ -93,18 +103,15 @@ cmake -S . -B build
 cmake --build build
 ```
 
-生成可执行文件：
+生成静态库：
 
 ```bash
-build/sipserver
+build/libsipserver.a
 ```
 
-同时会生成这些静态库目标：
+生成示例程序：
 
-- `libsipserver_config.a`
-- `libsipserver_media.a`
-- `libsipserver_session.a`
-- `libsipserver_embed.a`
+- `build/sipserver_upper_push_demo`
 
 ## 运行
 
@@ -114,7 +121,7 @@ build/sipserver
 AAC 模式：
 
 ```bash
-./build/sipserver \
+./build/sipserver_upper_push_demo \
   --bind-ip 0.0.0.0 \
   --media-ip 192.168.1.10 \
   --audio-codec aac
@@ -123,7 +130,7 @@ AAC 模式：
 G711A 模式：
 
 ```bash
-./build/sipserver \
+./build/sipserver_upper_push_demo \
   --bind-ip 0.0.0.0 \
   --media-ip 192.168.1.10 \
   --audio-codec g711a
@@ -132,7 +139,7 @@ G711A 模式：
 Linphone 示例：
 
 ```bash
-./build/sipserver \
+./build/sipserver_upper_push_demo \
   --bind-ip 0.0.0.0 \
   --media-ip 192.168.18.126 \
   --sip-port 6060 \
@@ -174,22 +181,14 @@ sip:test@192.168.18.126:6060;transport=udp
 
 ## 嵌入式库分层
 
-当前仓库已经不是单纯的示例主程序，而是拆成可复用的静态库：
+当前仓库已经收敛成一个独立静态库 `sipserver`，`src/` 下只保留库实现代码。
+对外接口统一从 `include/sipserver/` 暴露；`src/internal/` 中的头文件仅供库内部编译使用，不再作为宿主 API。
 
-- `sipserver_config`
-  负责默认值、参数解析、参数校验和配置结构体定义
-- `sipserver_media`
-  负责 RTP socket、发送队列、RTP 打包、媒体发送和接收回调
-- `sipserver_session`
-  负责 SIP 报文解析、事务/对话维护、Offer/Answer 驱动和媒体会话启动
-- `sipserver_embed`
-  负责给宿主提供一个更适合嵌入式接入的统一入口，内部维护当前活动会话、默认应答策略以及线程安全送帧接口
-
-`main.c` 现在只保留为宿主示例，负责加载本地 demo 媒体并通过 `sip_embed_service_*()` 接口持续送帧。
+`example/upper_push_demo.c` 只保留为宿主示例，负责加载本地 demo 媒体并通过 `sip_embed_service_*()` 接口持续送帧。
 
 ## 上层推流演示
 
-当前仓库里的 `main` 是嵌入式接入示例，也是现在唯一保留的运行方式。
+当前仓库里的 `example/upper_push_demo.c` 是嵌入式接入示例，也是现在唯一保留的演示方式。
 它演示了宿主怎样做这几件事：
 
 - 创建并运行 `sip_embed_service_t`
@@ -197,11 +196,11 @@ sip:test@192.168.18.126:6060;transport=udp
 - 在宿主线程里轮询当前会话状态并感知会话切换
 - 在需要时通过线程安全接口实时喂入音频和视频帧
 
-当前 `main` 的运行方式已经固定为上层推流演示：
+当前示例程序的运行方式已经固定为上层推流演示：
 
 当前行为：
 
-- `main.c` 启动后会固定进入上层推流演示流程
+- `example/upper_push_demo.c` 启动后会固定进入上层推流演示流程
 - 会启动两个示例线程，模拟上层持续调用 `sip_embed_service_push_audio_frame()` 和 `sip_embed_service_push_video_frame()` 喂流
 - `response->media.live_input_only` 固定置为 `1`
 - `streamer` 内部不再加载或回退到默认测试素材发送；媒体完全来自上层输入队列
@@ -222,7 +221,7 @@ int sip_embed_service_push_video_frame(sip_embed_service_t *service,
                                        uint32_t rtp_timestamp);
 ```
 
-`main.c` 里可以直接参考的关键实现：
+`example/upper_push_demo.c` 里可以直接参考的关键实现：
 
 - `sip_embed_service_create()` / `sip_embed_service_destroy()`
   创建和释放嵌入式服务实例
@@ -268,9 +267,9 @@ sip_embed_service_push_video_frame(service,
   `PCMA` 通常每 20ms 增加 `160`，`AAC-LC 48kHz` 每帧增加 `1024`
 - 视频时间戳通常按 90k 时钟递增
 - 视频输入应是完整 H264 Access Unit，内部会再做 RTP 分片
-- `main.c` 里的 demo 线程正是按这个方式推送 `test_media/audio.g711a` 和 `test_media/video.h264`
+- `example/upper_push_demo.c` 里的 demo 线程正是按这个方式推送 `test_media/audio.g711a` 和 `test_media/video.h264`
 
-`on_media` 回调参数定义见 `include/streamer.h`：
+`on_media` 回调参数定义见 `include/sipserver/streamer.h`：
 
 - `kind`：音频或视频
 - `payload` / `payload_size`：RTP payload 原始负载
@@ -282,8 +281,8 @@ sip_embed_service_push_video_frame(service,
 - 当前回调拿到的是原始 RTP payload，不是解码后的 PCM/YUV
 - 发送线程和接收回调复用本地 RTP 端口
 - `sip_server_run()` 和 `sip_server_run_with_handlers()` 仍然保留；但当前仓库更推荐通过 `sip_embed_service_run()` 作为嵌入式入口
-- 当前 `main.c` 示例默认按 `G711A + H264` 思路接管协商；如果你切到 `--audio-codec aac`，还需要在你的上层里补 AAC 的 Offer 解析和接听策略
-- 如果你要接自己的宿主程序，最直接的做法就是复用 `sip_embed_service_*()` 这一层，把 `main.c` 里的 demo 线程替换成你自己的采集、编码或转发线程
+- 当前示例默认按 `G711A + H264` 思路接管协商；如果你切到 `--audio-codec aac`，还需要在你的上层里补 AAC 的 Offer 解析和接听策略
+- 如果你要接自己的宿主程序，最直接的做法就是复用 `sip_embed_service_*()` 这一层，把 `example/upper_push_demo.c` 里的 demo 线程替换成你自己的采集、编码或转发线程
 
 ## 后续扩展建议
 

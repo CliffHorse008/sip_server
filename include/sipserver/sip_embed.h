@@ -1,21 +1,13 @@
-#ifndef SIP_EMBED_H
-#define SIP_EMBED_H
+#ifndef SIPSERVER_SIP_EMBED_H
+#define SIPSERVER_SIP_EMBED_H
 
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#include "sip_server.h"
+#include "sipserver/sip_session.h"
 
-/* 嵌入式宿主可选的上层回调。
- * 如果未设置 on_invite，则使用库内默认的最小接听策略。
- */
-typedef struct {
-    sip_signal_callback_t on_signal;
-    sip_invite_callback_t on_invite;
-    streamer_receive_callback_t on_media;
-    void *user_data;
-} sip_embed_callbacks_t;
+typedef sip_session_callbacks_t sip_embed_callbacks_t;
 
 /* 嵌入式服务实例的前置声明。 */
 typedef struct sip_embed_service sip_embed_service_t;

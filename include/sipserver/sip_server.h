@@ -1,9 +1,9 @@
-#ifndef SIP_SERVER_H
-#define SIP_SERVER_H
+#ifndef SIPSERVER_SIP_SERVER_H
+#define SIPSERVER_SIP_SERVER_H
 
 #include <signal.h>
 
-#include "streamer.h"
+#include "sipserver/streamer.h"
 
 /* 对外暴露的关键信令事件类型。 */
 typedef enum {

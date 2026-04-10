@@ -1,10 +1,10 @@
-#ifndef STREAMER_H
-#define STREAMER_H
+#ifndef SIPSERVER_STREAMER_H
+#define SIPSERVER_STREAMER_H
 
 #include <stddef.h>
 #include <stdint.h>
 
-#include "config.h"
+#include "sipserver/config.h"
 
 #define STREAMER_SDP_MAX_MEDIA 8
 

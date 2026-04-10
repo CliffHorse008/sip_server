@@ -1,4 +1,4 @@
-#include "streamer.h"
+#include "sipserver/streamer.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -12,7 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "net.h"
+#include "internal/net.h"
 
 #define RTP_HEADER_SIZE 12
 #define RTP_MAX_PAYLOAD 1200

@@ -1,4 +1,4 @@
-#include "net.h"
+#include "internal/net.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>

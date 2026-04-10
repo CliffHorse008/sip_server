@@ -1,5 +1,5 @@
-#ifndef CONFIG_H
-#define CONFIG_H
+#ifndef SIPSERVER_CONFIG_H
+#define SIPSERVER_CONFIG_H
 
 #include <stdint.h>
 #include <stdio.h>
