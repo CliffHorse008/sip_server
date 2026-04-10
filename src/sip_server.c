@@ -813,6 +813,11 @@ static int dialog_matches(const sip_dialog_t *dialog, const sip_request_t *reque
            request_has_local_tag(request, dialog->local_tag);
 }
 
+static int dialog_conflicts_with_new_invite(const sip_dialog_t *dialog, const sip_request_t *request)
+{
+    return dialog->active && !dialog_matches(dialog, request);
+}
+
 static int terminated_dialog_matches(const terminated_dialog_t *dialog, const sip_request_t *request)
 {
     return dialog->valid &&
@@ -1451,6 +1456,38 @@ int sip_server_run_with_handlers(const app_config_t *config,
                 emit_signal_event(handlers, streamer, SIP_SIGNAL_OPTIONS_RECEIVED, &request, NULL, 0, NULL, request.body);
             } else if (str_case_equal(request.method, "REGISTER")) {
                 emit_signal_event(handlers, streamer, SIP_SIGNAL_REGISTER_RECEIVED, &request, NULL, 0, NULL, request.body);
+            }
+
+            if (str_case_equal(request.method, "INVITE") && dialog_conflicts_with_new_invite(&dialog, &request)) {
+                char busy_local_tag[32];
+
+                generate_local_tag(busy_local_tag, sizeof(busy_local_tag));
+                fprintf(stdout,
+                        "rejecting INVITE while dialog is active current_call_id=%s new_call_id=%s\n",
+                        dialog.call_id,
+                        request.call_id);
+                if (send_response_and_emit(sip_socket,
+                                           &peer,
+                                           &request,
+                                           486,
+                                           "Busy Here",
+                                           busy_local_tag,
+                                           config,
+                                           NULL,
+                                           NULL,
+                                           handlers,
+                                           streamer) == 0) {
+                    invite_transaction_store_in_table(invite_transactions,
+                                                      SIP_MAX_INVITE_TRANSACTIONS,
+                                                      &request,
+                                                      &peer,
+                                                      486,
+                                                      "Busy Here",
+                                                      busy_local_tag,
+                                                      NULL,
+                                                      NULL);
+                }
+                continue;
             }
 
             if (str_case_equal(request.method, "OPTIONS") || str_case_equal(request.method, "REGISTER")) {
