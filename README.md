@@ -83,6 +83,24 @@ chmod +x scripts/prepare_media.sh
 ./scripts/prepare_media.sh
 ```
 
+如果要指定别的视频文件，也可以显式传入输入路径：
+
+```bash
+./scripts/prepare_media.sh -i /path/to/input.mp4
+```
+
+如果输入视频不是 30fps，或者你想显式控制 demo 码流节奏，也可以指定输出帧率：
+
+```bash
+./scripts/prepare_media.sh -i /path/to/input.mp4 -r 25
+```
+
+也兼容位置参数写法：
+
+```bash
+./scripts/prepare_media.sh /path/to/input.mp4 /path/to/output_dir
+```
+
 默认会生成：
 
 - `test_media/video.h264`
@@ -91,10 +109,11 @@ chmod +x scripts/prepare_media.sh
 
 说明：
 
-- `video.h264` 会插入 AUD，便于最小 RTP 发送器按帧节奏发送
-- `audio.aac` 为 ADTS 格式
+- `video.h264` 会被标准化成固定帧率、`yuv420p`、无 B 帧、带 AUD 的 H264，便于当前 demo 发送器按固定节奏送帧
+- `audio.aac` 会转成 ADTS 格式 AAC
 - `audio.g711a` 为 8kHz/mono 原始 A-law 负载
 - 如果源文件音轨本身是静音，脚本会自动为 `audio.g711a` 生成 440Hz 测试音，便于联调
+- 如果你用 `-r/--video-fps` 指定了别的输出帧率，运行示例程序时也建议同步设置 `--video-fps`，保持发送节奏一致
 
 ## 编译
 
