@@ -189,16 +189,6 @@ static void sip_session_on_media(const streamer_rtp_packet_t *packet, void *user
 {
     sip_session_service_t *service = (sip_session_service_t *) user_data;
 
-    fprintf(stdout,
-            "media rx kind=%s pt=%u seq=%u ts=%u size=%zu from=%s:%u\n",
-            packet->kind == STREAMER_MEDIA_AUDIO ? "audio" : "video",
-            packet->payload_type,
-            packet->sequence,
-            packet->timestamp,
-            packet->payload_size,
-            packet->source_ip != NULL ? packet->source_ip : "-",
-            packet->source_port);
-
     if (service->callbacks.on_media != NULL) {
         service->callbacks.on_media(packet, service->callbacks.user_data);
     }

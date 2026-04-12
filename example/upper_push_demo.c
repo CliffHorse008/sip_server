@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "sipserver/config.h"
@@ -39,6 +40,12 @@ typedef struct {
     const app_config_t *config;
     sip_embed_service_t *service;
     sample_demo_media_t demo_media;
+    pthread_mutex_t media_log_mutex;
+    long long media_log_window_start_ms;
+    unsigned int media_log_packet_count;
+    size_t media_log_total_bytes;
+    unsigned int media_log_audio_packets;
+    unsigned int media_log_video_packets;
 } sample_host_t;
 
 /* 捕获退出信号，让主循环和工作线程尽快收敛。 */
@@ -61,6 +68,14 @@ static void sleep_ns(long long nanoseconds)
     ts.tv_nsec = (long) (nanoseconds % 1000000000LL);
     while (nanosleep(&ts, &ts) != 0 && g_stop == 0) {
     }
+}
+
+static long long monotonic_time_ms(void)
+{
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+    return (long long) tv.tv_sec * 1000LL + (long long) tv.tv_usec / 1000LL;
 }
 
 /* 一次性把整个文件读入内存，用于测试媒体加载。 */
@@ -458,12 +473,67 @@ static void sample_demo_media_stop(sample_host_t *host)
     }
 }
 
+static void sample_host_on_media(const streamer_rtp_packet_t *packet, void *user_data)
+{
+    sample_host_t *host = (sample_host_t *) user_data;
+    long long now_ms = monotonic_time_ms();
+    int should_log = 0;
+    unsigned int packet_count = 0;
+    size_t total_bytes = 0;
+    unsigned int audio_packets = 0;
+    unsigned int video_packets = 0;
+
+    pthread_mutex_lock(&host->media_log_mutex);
+    if (host->media_log_window_start_ms == 0) {
+        host->media_log_window_start_ms = now_ms;
+    }
+
+    ++host->media_log_packet_count;
+    host->media_log_total_bytes += packet->payload_size;
+    if (packet->kind == STREAMER_MEDIA_AUDIO) {
+        ++host->media_log_audio_packets;
+    } else {
+        ++host->media_log_video_packets;
+    }
+
+    if (now_ms - host->media_log_window_start_ms >= 1000) {
+        should_log = 1;
+        packet_count = host->media_log_packet_count;
+        total_bytes = host->media_log_total_bytes;
+        audio_packets = host->media_log_audio_packets;
+        video_packets = host->media_log_video_packets;
+        host->media_log_window_start_ms = now_ms;
+        host->media_log_packet_count = 0;
+        host->media_log_total_bytes = 0;
+        host->media_log_audio_packets = 0;
+        host->media_log_video_packets = 0;
+    }
+    pthread_mutex_unlock(&host->media_log_mutex);
+
+    if (should_log) {
+        fprintf(stdout,
+                "media rx packets=%u bytes=%zu audio=%u video=%u last_kind=%s pt=%u seq=%u ts=%u size=%zu from=%s:%u\n",
+                packet_count,
+                total_bytes,
+                audio_packets,
+                video_packets,
+                packet->kind == STREAMER_MEDIA_AUDIO ? "audio" : "video",
+                packet->payload_type,
+                packet->sequence,
+                packet->timestamp,
+                packet->payload_size,
+                packet->source_ip != NULL ? packet->source_ip : "-",
+                packet->source_port);
+    }
+}
+
 /* 释放 SDK 上下文持有的线程、媒体缓存与互斥锁。 */
 static void sample_host_destroy(sample_host_t *host)
 {
     sample_demo_media_t *demo_media = &host->demo_media;
 
     sample_demo_media_stop(host);
+    pthread_mutex_destroy(&host->media_log_mutex);
     free(demo_media->video_frames);
     free(demo_media->video_blob);
     free(demo_media->audio_blob);
@@ -475,6 +545,10 @@ static int sample_host_init(sample_host_t *host, const app_config_t *config, sip
     memset(host, 0, sizeof(*host));
     host->config = config;
     host->service = service;
+
+    if (pthread_mutex_init(&host->media_log_mutex, NULL) != 0) {
+        return -1;
+    }
 
     if (sample_demo_media_load(host) != 0) {
         sample_host_destroy(host);
@@ -494,6 +568,7 @@ int main(int argc, char **argv)
     app_config_t config;
     sample_host_t host;
     sip_embed_service_t *service;
+    sip_embed_callbacks_t callbacks;
     int parse_rc;
     int run_rc;
 
@@ -518,6 +593,11 @@ int main(int argc, char **argv)
         sip_embed_service_destroy(service);
         return 1;
     }
+
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.on_media = sample_host_on_media;
+    callbacks.user_data = &host;
+    sip_embed_service_set_callbacks(service, &callbacks);
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
