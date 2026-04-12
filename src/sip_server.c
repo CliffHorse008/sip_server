@@ -142,6 +142,11 @@ static int str_case_prefix(const char *line, const char *prefix, size_t prefix_l
     return 1;
 }
 
+static const char *default_sdp_transport(const app_config_t *config)
+{
+    return config->rtp_transport == RTP_TRANSPORT_KCP ? "KCP/RTP/AVP" : "RTP/AVP";
+}
+
 static long long monotonic_time_ms(void)
 {
     struct timeval tv;
@@ -646,9 +651,22 @@ static int is_sdp_direction_attribute(const char *value)
            str_case_equal(value, "inactive");
 }
 
-static int sdp_transport_supported(const char *transport)
+static int sdp_transport_supported(const char *transport, const app_config_t *config)
 {
+    if (config->rtp_transport == RTP_TRANSPORT_KCP) {
+        return str_case_equal(transport, "KCP/RTP/AVP") || str_case_equal(transport, "KCP/RTP/AVPF");
+    }
+
     return str_case_equal(transport, "RTP/AVP") || str_case_equal(transport, "RTP/AVPF");
+}
+
+static const char *select_sdp_transport(const char *transport, const app_config_t *config)
+{
+    if (transport != NULL && transport[0] != '\0' && sdp_transport_supported(transport, config)) {
+        return transport;
+    }
+
+    return default_sdp_transport(config);
 }
 
 static sdp_payload_desc_t *find_payload_desc(sdp_media_offer_t *media, unsigned int payload_type)
@@ -918,9 +936,12 @@ static int build_sdp_plan(const sdp_offer_t *offer,
         planned->direction = offered->direction == STREAMER_DIRECTION_RECVONLY
                                  ? STREAMER_DIRECTION_SENDONLY
                                  : STREAMER_DIRECTION_SENDRECV;
-        snprintf(planned->transport, sizeof(planned->transport), "%s", offered->transport);
+        snprintf(planned->transport,
+                 sizeof(planned->transport),
+                 "%s",
+                 select_sdp_transport(offered->transport, config));
 
-        if (!sdp_transport_supported(offered->transport) || offered->port == 0) {
+        if (!sdp_transport_supported(offered->transport, config) || offered->port == 0) {
             continue;
         }
 
@@ -1529,6 +1550,18 @@ static void normalize_invite_response(const sip_request_t *request,
         if (response->media.video_payload_type == 0 && response->media.video_port != 0) {
             response->media.video_payload_type = 96;
         }
+        if (response->media.audio_port != 0 && response->media.audio_transport[0] == '\0') {
+            snprintf(response->media.audio_transport,
+                     sizeof(response->media.audio_transport),
+                     "%s",
+                     default_sdp_transport(config));
+        }
+        if (response->media.video_port != 0 && response->media.video_transport[0] == '\0') {
+            snprintf(response->media.video_transport,
+                     sizeof(response->media.video_transport),
+                     "%s",
+                     default_sdp_transport(config));
+        }
         if (response->media.video_port != 0 && !response->media.video_enabled) {
             response->media.video_enabled = 1;
         }
@@ -1580,6 +1613,25 @@ static int build_default_invite_response(const sdp_offer_t *offer,
     snprintf(response->reason_phrase, sizeof(response->reason_phrase), "%s", "OK");
     snprintf(response->media.remote_ip, sizeof(response->media.remote_ip), "%s", remote_ip);
     response->media.remote_ip_alt[0] = '\0';
+    response->media.audio_transport[0] = '\0';
+    response->media.video_transport[0] = '\0';
+    {
+        size_t media_index;
+
+        for (media_index = 0; media_index < plan.media_count; ++media_index) {
+            if (plan.media[media_index].kind == STREAMER_MEDIA_AUDIO && plan.media[media_index].accepted) {
+                snprintf(response->media.audio_transport,
+                         sizeof(response->media.audio_transport),
+                         "%s",
+                         plan.media[media_index].transport);
+            } else if (plan.media[media_index].kind == STREAMER_MEDIA_VIDEO && plan.media[media_index].accepted) {
+                snprintf(response->media.video_transport,
+                         sizeof(response->media.video_transport),
+                         "%s",
+                         plan.media[media_index].transport);
+            }
+        }
+    }
     response->media.audio_codec = config->audio_codec;
     response->media.video_enabled = response->media.video_port != 0;
 
@@ -1591,6 +1643,7 @@ static int build_default_invite_response(const sdp_offer_t *offer,
 }
 
 static int build_current_session_sdp(streamer_t *streamer,
+                                     const app_config_t *config,
                                      const streamer_session_params_t *media,
                                      char *buffer,
                                      size_t buffer_size)
@@ -1607,7 +1660,12 @@ static int build_current_session_sdp(streamer_t *streamer,
         audio->accepted = 1;
         audio->payload_type = media->audio_payload_type;
         audio->direction = STREAMER_DIRECTION_SENDRECV;
-        snprintf(audio->transport, sizeof(audio->transport), "%s", "RTP/AVP");
+        snprintf(audio->transport,
+                 sizeof(audio->transport),
+                 "%s",
+                 media->audio_transport[0] != '\0'
+                     ? media->audio_transport
+                     : default_sdp_transport(config));
     }
 
     if (media->video_enabled && media->video_port != 0) {
@@ -1618,7 +1676,12 @@ static int build_current_session_sdp(streamer_t *streamer,
         video->accepted = 1;
         video->payload_type = media->video_payload_type;
         video->direction = STREAMER_DIRECTION_SENDRECV;
-        snprintf(video->transport, sizeof(video->transport), "%s", "RTP/AVP");
+        snprintf(video->transport,
+                 sizeof(video->transport),
+                 "%s",
+                 media->video_transport[0] != '\0'
+                     ? media->video_transport
+                     : default_sdp_transport(config));
     }
 
     if (plan.media_count == 0) {
@@ -1674,7 +1737,7 @@ static void summarize_offer_for_upper_layer(const sdp_offer_t *offer,
             }
         }
 
-        if (!sdp_transport_supported(media->transport) || media->port == 0) {
+        if (!sdp_transport_supported(media->transport, config) || media->port == 0) {
             continue;
         }
 
@@ -1864,6 +1927,7 @@ static void handle_sip_message(int message_socket,
         invite_response.media = dialog->media;
 
         if (build_current_session_sdp(streamer,
+                                      config,
                                       &dialog->media,
                                       invite_response.answer_sdp,
                                       sizeof(invite_response.answer_sdp)) != 0) {

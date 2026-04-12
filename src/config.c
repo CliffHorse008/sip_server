@@ -44,6 +44,20 @@ static int parse_sip_transport(const char *value, sip_transport_t *out)
     return -1;
 }
 
+static int parse_rtp_transport(const char *value, rtp_transport_t *out)
+{
+    if (strcmp(value, "udp") == 0) {
+        *out = RTP_TRANSPORT_UDP;
+        return 0;
+    }
+    if (strcmp(value, "kcp") == 0) {
+        *out = RTP_TRANSPORT_KCP;
+        return 0;
+    }
+
+    return -1;
+}
+
 void config_set_defaults(app_config_t *config)
 {
     memset(config, 0, sizeof(*config));
@@ -51,6 +65,7 @@ void config_set_defaults(app_config_t *config)
     snprintf(config->bind_ip, sizeof(config->bind_ip), "0.0.0.0");
     snprintf(config->media_ip, sizeof(config->media_ip), "127.0.0.1");
     config->sip_transport = SIP_TRANSPORT_UDP;
+    config->rtp_transport = RTP_TRANSPORT_UDP;
     config->sip_port = 5060;
     config->sip_session_expires = 90;
     config->audio_port = 5004;
@@ -72,6 +87,11 @@ const char *config_sip_transport_name(sip_transport_t transport)
     return transport == SIP_TRANSPORT_TCP ? "tcp" : "udp";
 }
 
+const char *config_rtp_transport_name(rtp_transport_t transport)
+{
+    return transport == RTP_TRANSPORT_KCP ? "kcp" : "udp";
+}
+
 void config_print_usage(FILE *stream, const char *program_name)
 {
     fprintf(stream,
@@ -80,6 +100,7 @@ void config_print_usage(FILE *stream, const char *program_name)
             "  --media-ip <ip>       SDP announced media address, default 127.0.0.1\n"
             "  --sip-port <port>     SIP listen port, default 5060\n"
             "  --sip-transport <t>   udp or tcp, default udp\n"
+            "  --rtp-transport <t>   udp or kcp, default udp\n"
             "  --sip-session-expires <sec>  SIP Session-Expires, default 90\n"
             "  --audio-port <port>   Local RTP audio port, default 5004\n"
             "  --video-port <port>   Local RTP video port, default 5006\n"
@@ -123,6 +144,11 @@ int config_parse(app_config_t *config, int argc, char **argv)
         } else if (strcmp(arg, "--sip-transport") == 0) {
             if (parse_sip_transport(argv[++index], &config->sip_transport) != 0) {
                 fprintf(stderr, "invalid sip transport\n");
+                return -1;
+            }
+        } else if (strcmp(arg, "--rtp-transport") == 0) {
+            if (parse_rtp_transport(argv[++index], &config->rtp_transport) != 0) {
+                fprintf(stderr, "invalid rtp transport\n");
                 return -1;
             }
         } else if (strcmp(arg, "--sip-session-expires") == 0) {

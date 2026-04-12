@@ -10,6 +10,7 @@ find_package(Threads REQUIRED)
 
 add_library(sipserver STATIC
     src/config.c
+    src/ikcp.c
     src/net.c
     src/streamer.c
     src/sip_session.c

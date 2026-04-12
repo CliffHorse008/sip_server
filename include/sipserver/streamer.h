@@ -61,6 +61,8 @@ typedef void (*streamer_receive_callback_t)(const streamer_rtp_packet_t *packet,
 typedef struct {
     char remote_ip[64];
     char remote_ip_alt[64];
+    char audio_transport[32];
+    char video_transport[32];
     uint16_t audio_port;
     uint16_t video_port;
     uint8_t audio_payload_type;

@@ -6,12 +6,13 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
+#include <string.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "internal/ikcp.h"
 #include "internal/net.h"
 
 #define RTP_HEADER_SIZE 12
@@ -22,11 +23,15 @@
 #define DEFAULT_AAC_CHANNELS 2
 #define DEFAULT_AAC_CONFIG_HEX "1190"
 #define DEFAULT_H264_PROFILE_LEVEL_ID "42E01F"
+#define KCP_AUDIO_CONV 0x41554430U
+#define KCP_VIDEO_CONV 0x56494430U
+
+typedef struct media_transport_state media_transport_state_t;
 
 typedef struct {
     streamer_t *streamer;
     streamer_media_kind_t kind;
-    int socket_fd;
+    media_transport_state_t *transport_state;
 } receive_thread_args_t;
 
 struct streamer {
@@ -49,13 +54,12 @@ struct streamer {
     void *receive_user_data;
     struct media_frame_queue *audio_queue_ptr;
     struct media_frame_queue *video_queue_ptr;
+    media_transport_state_t *audio_transport_state_ptr;
+    media_transport_state_t *video_transport_state_ptr;
 };
 
 typedef struct {
-    int socket_fd;
-    struct sockaddr_in remote_addr;
-    int has_alt_remote;
-    struct sockaddr_in alt_remote_addr;
+    media_transport_state_t *transport_state;
     uint16_t sequence;
     uint32_t timestamp;
     uint32_t ssrc;
@@ -78,11 +82,249 @@ typedef struct media_frame_queue {
     int stopped;
 } media_frame_queue_t;
 
+struct media_transport_state {
+    int socket_fd;
+    int use_kcp;
+    int has_remote;
+    struct sockaddr_in remote_addr;
+    int has_alt_remote;
+    struct sockaddr_in alt_remote_addr;
+    uint32_t kcp_conv;
+    ikcpcb *kcp;
+    pthread_mutex_t mutex;
+};
+
 void streamer_stop(streamer_t *streamer);
 
 static unsigned int random_u32(void)
 {
     return ((unsigned int) rand() << 16) ^ (unsigned int) rand();
+}
+
+static uint32_t monotonic_time_ms32(void)
+{
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+    return (uint32_t) ((uint64_t) tv.tv_sec * 1000ULL + (uint64_t) tv.tv_usec / 1000ULL);
+}
+
+static int string_case_prefix(const char *text, const char *prefix)
+{
+    while (*prefix != '\0') {
+        unsigned char lhs;
+        unsigned char rhs;
+
+        if (*text == '\0') {
+            return 0;
+        }
+
+        lhs = (unsigned char) *text++;
+        rhs = (unsigned char) *prefix++;
+        if (lhs >= 'A' && lhs <= 'Z') {
+            lhs = (unsigned char) (lhs - 'A' + 'a');
+        }
+        if (rhs >= 'A' && rhs <= 'Z') {
+            rhs = (unsigned char) (rhs - 'A' + 'a');
+        }
+        if (lhs != rhs) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int transport_uses_kcp(const char *transport)
+{
+    return transport != NULL && string_case_prefix(transport, "kcp/");
+}
+
+static const char *default_media_transport(const app_config_t *config)
+{
+    return config->rtp_transport == RTP_TRANSPORT_KCP ? "KCP/RTP/AVP" : "RTP/AVP";
+}
+
+static int transport_send_raw_locked(media_transport_state_t *state, const unsigned char *packet, size_t packet_size)
+{
+    if (!state->has_remote) {
+        errno = ENOTCONN;
+        return -1;
+    }
+
+    if (sendto(state->socket_fd,
+               packet,
+               packet_size,
+               0,
+               (const struct sockaddr *) &state->remote_addr,
+               sizeof(state->remote_addr)) < 0) {
+        return -1;
+    }
+
+    if (state->has_alt_remote) {
+        if (sendto(state->socket_fd,
+                   packet,
+                   packet_size,
+                   0,
+                   (const struct sockaddr *) &state->alt_remote_addr,
+                   sizeof(state->alt_remote_addr)) < 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int kcp_output_callback(const char *buf, int len, ikcpcb *kcp, void *user)
+{
+    media_transport_state_t *state = (media_transport_state_t *) user;
+
+    (void) kcp;
+    return transport_send_raw_locked(state, (const unsigned char *) buf, (size_t) len);
+}
+
+static int media_transport_state_init(media_transport_state_t *state, int socket_fd)
+{
+    memset(state, 0, sizeof(*state));
+    state->socket_fd = socket_fd;
+    return pthread_mutex_init(&state->mutex, NULL);
+}
+
+static void media_transport_state_reset(media_transport_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&state->mutex);
+    if (state->kcp != NULL) {
+        ikcp_release(state->kcp);
+        state->kcp = NULL;
+    }
+    state->use_kcp = 0;
+    state->has_remote = 0;
+    state->has_alt_remote = 0;
+    state->kcp_conv = 0;
+    memset(&state->remote_addr, 0, sizeof(state->remote_addr));
+    memset(&state->alt_remote_addr, 0, sizeof(state->alt_remote_addr));
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static void media_transport_state_destroy(media_transport_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    media_transport_state_reset(state);
+    pthread_mutex_destroy(&state->mutex);
+}
+
+static int media_transport_state_configure(media_transport_state_t *state,
+                                           const char *transport,
+                                           const char *remote_ip,
+                                           const char *remote_ip_alt,
+                                           uint16_t remote_port,
+                                           uint32_t kcp_conv)
+{
+    ikcpcb *kcp = NULL;
+
+    if (state == NULL || remote_ip == NULL || remote_ip[0] == '\0' || remote_port == 0) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&state->mutex);
+    if (state->kcp != NULL) {
+        ikcp_release(state->kcp);
+        state->kcp = NULL;
+    }
+    state->use_kcp = transport_uses_kcp(transport);
+    state->has_remote = 0;
+    state->has_alt_remote = 0;
+    state->kcp_conv = state->use_kcp ? kcp_conv : 0;
+
+    if (sockaddr_from_ip_port(remote_ip, remote_port, &state->remote_addr) != 0) {
+        pthread_mutex_unlock(&state->mutex);
+        return -1;
+    }
+    state->has_remote = 1;
+
+    if (remote_ip_alt != NULL &&
+        remote_ip_alt[0] != '\0' &&
+        strcmp(remote_ip_alt, remote_ip) != 0 &&
+        sockaddr_from_ip_port(remote_ip_alt, remote_port, &state->alt_remote_addr) == 0) {
+        state->has_alt_remote = 1;
+    }
+
+    if (!state->use_kcp) {
+        pthread_mutex_unlock(&state->mutex);
+        return 0;
+    }
+
+    kcp = ikcp_create(kcp_conv, state);
+    if (kcp == NULL) {
+        state->has_remote = 0;
+        state->has_alt_remote = 0;
+        pthread_mutex_unlock(&state->mutex);
+        return -1;
+    }
+
+    ikcp_setoutput(kcp, kcp_output_callback);
+    ikcp_setmtu(kcp, 1400);
+    ikcp_wndsize(kcp, 128, 128);
+    ikcp_nodelay(kcp, 1, 20, 2, 1);
+    state->kcp = kcp;
+    pthread_mutex_unlock(&state->mutex);
+    return 0;
+}
+
+static void media_transport_tick(media_transport_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&state->mutex);
+    if (state->use_kcp && state->kcp != NULL) {
+        ikcp_update(state->kcp, monotonic_time_ms32());
+    }
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static int media_transport_send_packet(media_transport_state_t *state,
+                                       const unsigned char *packet,
+                                       size_t packet_size)
+{
+    int rc;
+
+    if (state == NULL) {
+        errno = ENOTCONN;
+        return -1;
+    }
+
+    pthread_mutex_lock(&state->mutex);
+    if (!state->use_kcp) {
+        rc = transport_send_raw_locked(state, packet, packet_size);
+        pthread_mutex_unlock(&state->mutex);
+        return rc;
+    }
+
+    if (state->kcp == NULL) {
+        pthread_mutex_unlock(&state->mutex);
+        errno = ENOTCONN;
+        return -1;
+    }
+
+    ikcp_update(state->kcp, monotonic_time_ms32());
+    rc = ikcp_send(state->kcp, (const char *) packet, (int) packet_size);
+    if (rc >= 0) {
+        ikcp_flush(state->kcp);
+        rc = 0;
+    } else {
+        rc = -1;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return rc;
 }
 
 static int set_socket_receive_timeout(int socket_fd, int timeout_ms)
@@ -346,24 +588,10 @@ static int rtp_send_packet(rtp_context_t *context,
     packet[11] = (unsigned char) (context->ssrc & 0xFF);
     memcpy(packet + RTP_HEADER_SIZE, payload, payload_size);
 
-    if (sendto(context->socket_fd,
-               packet,
-               RTP_HEADER_SIZE + payload_size,
-               0,
-               (const struct sockaddr *) &context->remote_addr,
-               sizeof(context->remote_addr)) < 0) {
+    if (media_transport_send_packet(context->transport_state,
+                                    packet,
+                                    RTP_HEADER_SIZE + payload_size) != 0) {
         return -1;
-    }
-
-    if (context->has_alt_remote) {
-        if (sendto(context->socket_fd,
-                   packet,
-                   RTP_HEADER_SIZE + payload_size,
-                   0,
-                   (const struct sockaddr *) &context->alt_remote_addr,
-                   sizeof(context->alt_remote_addr)) < 0) {
-            return -1;
-        }
     }
 
     ++context->sequence;
@@ -503,7 +731,8 @@ static void media_frame_release(media_frame_t *frame)
 }
 
 static int create_rtp_context(const app_config_t *config,
-                              int socket_fd,
+                              media_transport_state_t *transport_state,
+                              const char *transport,
                               uint16_t local_port,
                               const char *remote_ip,
                               const char *remote_ip_alt,
@@ -512,21 +741,16 @@ static int create_rtp_context(const app_config_t *config,
                               rtp_context_t *context)
 {
     (void) config;
+    (void) transport;
     (void) local_port;
+    (void) remote_ip;
+    (void) remote_ip_alt;
+    (void) remote_port;
     memset(context, 0, sizeof(*context));
-    context->socket_fd = socket_fd;
-
-    if (sockaddr_from_ip_port(remote_ip, remote_port, &context->remote_addr) != 0) {
+    if (transport_state == NULL) {
         return -1;
     }
-
-    if (remote_ip_alt != NULL &&
-        remote_ip_alt[0] != '\0' &&
-        strcmp(remote_ip_alt, remote_ip) != 0 &&
-        sockaddr_from_ip_port(remote_ip_alt, remote_port, &context->alt_remote_addr) == 0) {
-        context->has_alt_remote = 1;
-    }
-
+    context->transport_state = transport_state;
     context->sequence = (uint16_t) random_u32();
     context->timestamp = initial_timestamp;
     context->ssrc = random_u32();
@@ -535,7 +759,7 @@ static int create_rtp_context(const app_config_t *config,
 
 static void destroy_rtp_context(rtp_context_t *context)
 {
-    context->socket_fd = -1;
+    context->transport_state = NULL;
 }
 
 static size_t rtp_header_size(const unsigned char *packet, size_t packet_size)
@@ -613,6 +837,60 @@ static void deliver_received_rtp(streamer_t *streamer,
     streamer->receive_callback(&callback_packet, streamer->receive_user_data);
 }
 
+static void media_transport_receive(streamer_t *streamer,
+                                    media_transport_state_t *state,
+                                    streamer_media_kind_t kind,
+                                    const unsigned char *packet,
+                                    size_t packet_size,
+                                    const struct sockaddr_in *peer)
+{
+    unsigned char decoded[1600];
+
+    if (state == NULL) {
+        return;
+    }
+
+    if (!state->use_kcp) {
+        deliver_received_rtp(streamer, kind, packet, packet_size, peer);
+        return;
+    }
+
+    pthread_mutex_lock(&state->mutex);
+    if (state->kcp == NULL) {
+        pthread_mutex_unlock(&state->mutex);
+        return;
+    }
+
+    ikcp_update(state->kcp, monotonic_time_ms32());
+    if (ikcp_input(state->kcp, (const char *) packet, (long) packet_size) != 0) {
+        pthread_mutex_unlock(&state->mutex);
+        return;
+    }
+    ikcp_flush(state->kcp);
+
+    while (1) {
+        int packet_len = ikcp_peeksize(state->kcp);
+
+        if (packet_len <= 0 || packet_len > (int) sizeof(decoded)) {
+            break;
+        }
+
+        packet_len = ikcp_recv(state->kcp, (char *) decoded, (int) sizeof(decoded));
+        if (packet_len <= 0) {
+            break;
+        }
+
+        pthread_mutex_unlock(&state->mutex);
+        deliver_received_rtp(streamer, kind, decoded, (size_t) packet_len, peer);
+        pthread_mutex_lock(&state->mutex);
+        if (state->kcp == NULL) {
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&state->mutex);
+}
+
 static void *receive_thread_main(void *opaque)
 {
     receive_thread_args_t *args = (receive_thread_args_t *) opaque;
@@ -622,13 +900,23 @@ static void *receive_thread_main(void *opaque)
     while (!streamer->stop_requested) {
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
-        ssize_t received = recvfrom(args->socket_fd, packet, sizeof(packet), 0, (struct sockaddr *) &peer, &peer_len);
+        ssize_t received = recvfrom(args->transport_state->socket_fd,
+                                    packet,
+                                    sizeof(packet),
+                                    0,
+                                    (struct sockaddr *) &peer,
+                                    &peer_len);
 
         if (received < 0) {
             continue;
         }
 
-        deliver_received_rtp(streamer, args->kind, packet, (size_t) received, &peer);
+        media_transport_receive(streamer,
+                                args->transport_state,
+                                args->kind,
+                                packet,
+                                (size_t) received,
+                                &peer);
     }
 
     return NULL;
@@ -640,7 +928,8 @@ static void *video_thread_main(void *opaque)
     rtp_context_t context;
 
     if (create_rtp_context(streamer->config,
-                           streamer->video_socket_fd,
+                           streamer->video_transport_state_ptr,
+                           streamer->session.video_transport,
                            streamer->config->video_port,
                            streamer->session.remote_ip,
                            streamer->session.remote_ip_alt,
@@ -651,16 +940,18 @@ static void *video_thread_main(void *opaque)
     }
 
     fprintf(stdout,
-            "video RTP start local=%u remote=%s%s%s:%u pt=%u\n",
+            "video RTP start local=%u remote=%s%s%s:%u pt=%u transport=%s\n",
             streamer->config->video_port,
             streamer->session.remote_ip,
             streamer->session.remote_ip_alt[0] != '\0' ? " alt=" : "",
             streamer->session.remote_ip_alt[0] != '\0' ? streamer->session.remote_ip_alt : "",
             streamer->session.video_port,
-            streamer->session.video_payload_type);
+            streamer->session.video_payload_type,
+            streamer->session.video_transport);
 
     while (!streamer->stop_requested) {
         media_frame_t frame;
+        media_transport_tick(streamer->video_transport_state_ptr);
 
         if (media_queue_pop(streamer->video_queue_ptr, &frame, 10)) {
             context.timestamp = frame.timestamp;
@@ -668,7 +959,7 @@ static void *video_thread_main(void *opaque)
                                           streamer->session.video_payload_type,
                                           frame.data,
                                           frame.size) != 0) {
-                perror("sendto(video-live)");
+                perror("send(video-live)");
                 media_frame_release(&frame);
                 break;
             }
@@ -687,7 +978,8 @@ static void *audio_thread_main(void *opaque)
     rtp_context_t context;
 
     if (create_rtp_context(streamer->config,
-                           streamer->audio_socket_fd,
+                           streamer->audio_transport_state_ptr,
+                           streamer->session.audio_transport,
                            streamer->config->audio_port,
                            streamer->session.remote_ip,
                            streamer->session.remote_ip_alt,
@@ -698,18 +990,20 @@ static void *audio_thread_main(void *opaque)
     }
 
     fprintf(stdout,
-            "audio RTP start local=%u remote=%s%s%s:%u pt=%u codec=%s\n",
+            "audio RTP start local=%u remote=%s%s%s:%u pt=%u codec=%s transport=%s\n",
             streamer->config->audio_port,
             streamer->session.remote_ip,
             streamer->session.remote_ip_alt[0] != '\0' ? " alt=" : "",
             streamer->session.remote_ip_alt[0] != '\0' ? streamer->session.remote_ip_alt : "",
             streamer->session.audio_port,
             streamer->session.audio_payload_type,
-            config_audio_codec_name(streamer->session.audio_codec));
+            config_audio_codec_name(streamer->session.audio_codec),
+            streamer->session.audio_transport);
 
     if (streamer->session.audio_codec == AUDIO_CODEC_AAC) {
         while (!streamer->stop_requested) {
             media_frame_t frame;
+            media_transport_tick(streamer->audio_transport_state_ptr);
 
             if (media_queue_pop(streamer->audio_queue_ptr, &frame, 10)) {
                 context.timestamp = frame.timestamp;
@@ -717,7 +1011,7 @@ static void *audio_thread_main(void *opaque)
                                        streamer->session.audio_payload_type,
                                        frame.data,
                                        frame.size) != 0) {
-                    perror("sendto(audio-aac-live)");
+                    perror("send(audio-aac-live)");
                     media_frame_release(&frame);
                     break;
                 }
@@ -728,6 +1022,7 @@ static void *audio_thread_main(void *opaque)
     } else {
         while (!streamer->stop_requested) {
             media_frame_t frame;
+            media_transport_tick(streamer->audio_transport_state_ptr);
 
             if (media_queue_pop(streamer->audio_queue_ptr, &frame, 10)) {
                 context.timestamp = frame.timestamp;
@@ -735,7 +1030,7 @@ static void *audio_thread_main(void *opaque)
                                          streamer->session.audio_payload_type,
                                          frame.data,
                                          frame.size) != 0) {
-                    perror("sendto(audio-g711a-live)");
+                    perror("send(audio-g711a-live)");
                     media_frame_release(&frame);
                     break;
                 }
@@ -760,6 +1055,8 @@ streamer_t *streamer_create(const app_config_t *config)
     streamer->config = config;
     streamer->audio_socket_fd = -1;
     streamer->video_socket_fd = -1;
+    streamer->audio_transport_state_ptr = NULL;
+    streamer->video_transport_state_ptr = NULL;
     streamer->audio_queue_ptr = media_queue_create(STREAMER_QUEUE_DEPTH);
     streamer->video_queue_ptr = media_queue_create(STREAMER_QUEUE_DEPTH);
     if (streamer->audio_queue_ptr == NULL || streamer->video_queue_ptr == NULL) {
@@ -786,6 +1083,41 @@ streamer_t *streamer_create(const app_config_t *config)
         return NULL;
     }
 
+    streamer->audio_transport_state_ptr = (media_transport_state_t *) calloc(1, sizeof(*streamer->audio_transport_state_ptr));
+    streamer->video_transport_state_ptr = (media_transport_state_t *) calloc(1, sizeof(*streamer->video_transport_state_ptr));
+    if (streamer->audio_transport_state_ptr == NULL || streamer->video_transport_state_ptr == NULL) {
+        free(streamer->audio_transport_state_ptr);
+        free(streamer->video_transport_state_ptr);
+        close(streamer->audio_socket_fd);
+        close(streamer->video_socket_fd);
+        media_queue_destroy(streamer->audio_queue_ptr);
+        media_queue_destroy(streamer->video_queue_ptr);
+        free(streamer);
+        return NULL;
+    }
+
+    {
+        int audio_state_ready = media_transport_state_init(streamer->audio_transport_state_ptr, streamer->audio_socket_fd) == 0;
+        int video_state_ready = media_transport_state_init(streamer->video_transport_state_ptr, streamer->video_socket_fd) == 0;
+
+        if (!audio_state_ready || !video_state_ready) {
+            if (audio_state_ready) {
+                pthread_mutex_destroy(&streamer->audio_transport_state_ptr->mutex);
+            }
+            if (video_state_ready) {
+                pthread_mutex_destroy(&streamer->video_transport_state_ptr->mutex);
+            }
+            free(streamer->audio_transport_state_ptr);
+            free(streamer->video_transport_state_ptr);
+            close(streamer->audio_socket_fd);
+            close(streamer->video_socket_fd);
+            media_queue_destroy(streamer->audio_queue_ptr);
+            media_queue_destroy(streamer->video_queue_ptr);
+            free(streamer);
+            return NULL;
+        }
+    }
+
     return streamer;
 }
 
@@ -801,6 +1133,14 @@ void streamer_destroy(streamer_t *streamer)
     }
     if (streamer->video_socket_fd >= 0) {
         close(streamer->video_socket_fd);
+    }
+    if (streamer->audio_transport_state_ptr != NULL) {
+        media_transport_state_destroy(streamer->audio_transport_state_ptr);
+        free(streamer->audio_transport_state_ptr);
+    }
+    if (streamer->video_transport_state_ptr != NULL) {
+        media_transport_state_destroy(streamer->video_transport_state_ptr);
+        free(streamer->video_transport_state_ptr);
     }
     media_queue_destroy(streamer->audio_queue_ptr);
     media_queue_destroy(streamer->video_queue_ptr);
@@ -829,6 +1169,13 @@ void streamer_stop(streamer_t *streamer)
         pthread_join(streamer->audio_receive_thread, NULL);
         streamer->audio_receive_running = 0;
     }
+
+    if (streamer->audio_transport_state_ptr != NULL) {
+        media_transport_state_reset(streamer->audio_transport_state_ptr);
+    }
+    if (streamer->video_transport_state_ptr != NULL) {
+        media_transport_state_reset(streamer->video_transport_state_ptr);
+    }
 }
 
 int streamer_start(streamer_t *streamer, const streamer_session_params_t *params)
@@ -842,11 +1189,45 @@ int streamer_start(streamer_t *streamer, const streamer_session_params_t *params
     media_queue_reset(streamer->video_queue_ptr);
     streamer->stop_requested = 0;
     streamer->session = *params;
+    if (streamer->session.audio_port != 0 && streamer->session.audio_transport[0] == '\0') {
+        snprintf(streamer->session.audio_transport,
+                 sizeof(streamer->session.audio_transport),
+                 "%s",
+                 default_media_transport(streamer->config));
+    }
+    if (streamer->session.video_port != 0 && streamer->session.video_transport[0] == '\0') {
+        snprintf(streamer->session.video_transport,
+                 sizeof(streamer->session.video_transport),
+                 "%s",
+                 default_media_transport(streamer->config));
+    }
+
+    if (streamer->session.audio_port != 0 &&
+        media_transport_state_configure(streamer->audio_transport_state_ptr,
+                                        streamer->session.audio_transport,
+                                        streamer->session.remote_ip,
+                                        streamer->session.remote_ip_alt,
+                                        streamer->session.audio_port,
+                                        KCP_AUDIO_CONV) != 0) {
+        return -1;
+    }
+
+    if (streamer->session.video_enabled &&
+        streamer->session.video_port != 0 &&
+        media_transport_state_configure(streamer->video_transport_state_ptr,
+                                        streamer->session.video_transport,
+                                        streamer->session.remote_ip,
+                                        streamer->session.remote_ip_alt,
+                                        streamer->session.video_port,
+                                        KCP_VIDEO_CONV) != 0) {
+        media_transport_state_reset(streamer->audio_transport_state_ptr);
+        return -1;
+    }
 
     if (streamer->receive_callback != NULL && params->video_enabled && params->video_port != 0) {
         streamer->video_receive_args.streamer = streamer;
         streamer->video_receive_args.kind = STREAMER_MEDIA_VIDEO;
-        streamer->video_receive_args.socket_fd = streamer->video_socket_fd;
+        streamer->video_receive_args.transport_state = streamer->video_transport_state_ptr;
         if (pthread_create(&streamer->video_receive_thread, NULL, receive_thread_main, &streamer->video_receive_args) == 0) {
             streamer->video_receive_running = 1;
         } else {
@@ -859,7 +1240,7 @@ int streamer_start(streamer_t *streamer, const streamer_session_params_t *params
     if (streamer->receive_callback != NULL && params->audio_port != 0) {
         streamer->audio_receive_args.streamer = streamer;
         streamer->audio_receive_args.kind = STREAMER_MEDIA_AUDIO;
-        streamer->audio_receive_args.socket_fd = streamer->audio_socket_fd;
+        streamer->audio_receive_args.transport_state = streamer->audio_transport_state_ptr;
         if (pthread_create(&streamer->audio_receive_thread, NULL, receive_thread_main, &streamer->audio_receive_args) == 0) {
             streamer->audio_receive_running = 1;
         } else {
@@ -889,10 +1270,12 @@ int streamer_start(streamer_t *streamer, const streamer_session_params_t *params
     }
 
     fprintf(stdout,
-            "media session to %s audio=%u video=%u codec=%s\n",
+            "media session to %s audio=%u(%s) video=%u(%s) codec=%s\n",
             streamer->session.remote_ip,
             streamer->session.audio_port,
+            streamer->session.audio_port != 0 ? streamer->session.audio_transport : "-",
             streamer->session.video_port,
+            streamer->session.video_port != 0 ? streamer->session.video_transport : "-",
             config_audio_codec_name(streamer->session.audio_codec));
 
     return 0;

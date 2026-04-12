@@ -3,7 +3,7 @@
 一个最小可编译的 SIP Server/RTP 发送/接收框架，使用 C 开发、CMake 构建，不依赖第三方运行库。当前仓库只保留“上层推流演示”这一种运行方式。工程目标是：
 
 - SIP 信令支持 UDP/TCP，默认监听 `5060/udp`
-- 媒体传输走 UDP/RTP
+- 媒体传输支持 UDP/RTP，可选 KCP/RTP 扩展
 - 视频支持 H264
 - 音频支持 AAC 和 G711A
 - 测试素材来自当前目录的 `video.mp4`
@@ -54,7 +54,7 @@
 当前实现是“最小框架”，重点在工程骨架、上层送帧链路和 RTP 回调接入点：
 
 - 支持 SIP 基础方法：`OPTIONS`、`REGISTER`、`INVITE`、`ACK`、`BYE`
-- SIP 信令可运行在 UDP 或 TCP；RTP 媒体仍然固定走 UDP
+- SIP 信令可运行在 UDP 或 TCP；RTP 媒体可选 `udp` 或 `kcp`
 - 收到 `INVITE` 后解析对端 SDP 中的 `m=`、`rtpmap`、`fmtp`、方向属性和 RTP 端口
 - 会按 Offer 生成最小可用的 SDP Answer，并沿用对端的 payload type
 - 收到 `ACK` 后启动音视频 RTP 发送线程，等待上层持续送帧
@@ -156,6 +156,16 @@ G711A 模式（UDP SIP）：
   --audio-codec g711a
 ```
 
+G711A 模式（UDP SIP + KCP RTP）：
+
+```bash
+./build/sipserver_upper_push_demo \
+  --bind-ip 0.0.0.0 \
+  --media-ip 192.168.1.10 \
+  --audio-codec g711a \
+  --rtp-transport kcp
+```
+
 Linphone 示例（UDP SIP）：
 
 ```bash
@@ -191,6 +201,7 @@ sip:test@192.168.18.126:6060;transport=tcp
 
 - `--sip-port`：SIP 监听端口，默认 `5060`
 - `--sip-transport`：SIP 信令传输方式，支持 `udp` / `tcp`，默认 `udp`
+- `--rtp-transport`：RTP 媒体传输方式，支持 `udp` / `kcp`，默认 `udp`
 - `--sip-session-expires`：SIP Session Timer 秒数，默认 `90`
 - `--audio-port`：本地音频 RTP 端口，默认 `5004`
 - `--video-port`：本地视频 RTP 端口，默认 `5006`
@@ -204,17 +215,19 @@ sip:test@192.168.18.126:6060;transport=tcp
 用标准 SIP 客户端发起 `INVITE` 时，Offer SDP 至少需要带上：
 
 - `c=IN IP4 <client_ip>`
-- `m=audio <rtp_port> RTP/AVP ...`
-- `m=video <rtp_port> RTP/AVP ...`
+- `m=audio <rtp_port> RTP/AVP ...` 或 `m=audio <rtp_port> KCP/RTP/AVP ...`
+- `m=video <rtp_port> RTP/AVP ...` 或 `m=video <rtp_port> KCP/RTP/AVP ...`
 
 当前实现对 SDP 的处理规则：
 
-- 支持 `RTP/AVP` 和 `RTP/AVPF`
+- `--rtp-transport udp` 时支持 `RTP/AVP` 和 `RTP/AVPF`
+- `--rtp-transport kcp` 时支持 `KCP/RTP/AVP` 和 `KCP/RTP/AVPF`
 - 音频当前仅协商 `PCMA`
 - 视频当前协商 `H264`
 - 未接受的媒体行会在 Answer 中返回 `port 0`
 
 服务端会根据 Offer 中的 IP/端口发送 RTP；在本机或 WSL 联调场景下，也会同时尝试向 `ACK` 的源地址发送 RTP，以规避客户端宣告地址和实际可达地址不一致的问题。
+启用 `kcp` 时，RTP 包会先封装进内置的 KCP 传输层，再通过同一个 UDP 端口收发。
 
 ## 嵌入式库分层
 

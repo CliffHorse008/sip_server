@@ -43,9 +43,14 @@ static uint8_t default_audio_payload_type(audio_codec_t codec)
     return codec == AUDIO_CODEC_G711A ? 8 : 97;
 }
 
-static const char *default_transport(const char *transport)
+static const char *default_transport_for_config(const app_config_t *config)
 {
-    return transport != NULL && transport[0] != '\0' ? transport : "RTP/AVP";
+    return config->rtp_transport == RTP_TRANSPORT_KCP ? "KCP/RTP/AVP" : "RTP/AVP";
+}
+
+static const char *default_transport(const app_config_t *config, const char *transport)
+{
+    return transport != NULL && transport[0] != '\0' ? transport : default_transport_for_config(config);
 }
 
 static void sip_session_service_set_stream(sip_session_service_t *service, streamer_t *streamer)
@@ -77,7 +82,10 @@ static int sip_session_service_build_answer(sip_session_service_t *service,
                                   ? event->offer_audio_payload_type
                                   : default_audio_payload_type(config->audio_codec);
         media->direction = STREAMER_DIRECTION_SENDRECV;
-        snprintf(media->transport, sizeof(media->transport), "%s", default_transport(event->offer_audio_transport));
+        snprintf(media->transport,
+                 sizeof(media->transport),
+                 "%s",
+                 default_transport(config, event->offer_audio_transport));
 
         if (config->audio_codec == AUDIO_CODEC_G711A && event->offer_audio_port != 0 && event->offer_audio_payload_type != 0) {
             media->accepted = 1;
@@ -92,7 +100,10 @@ static int sip_session_service_build_answer(sip_session_service_t *service,
         media->kind = STREAMER_MEDIA_VIDEO;
         media->payload_type = event->offer_video_payload_type != 0 ? event->offer_video_payload_type : 96;
         media->direction = STREAMER_DIRECTION_SENDRECV;
-        snprintf(media->transport, sizeof(media->transport), "%s", default_transport(event->offer_video_transport));
+        snprintf(media->transport,
+                 sizeof(media->transport),
+                 "%s",
+                 default_transport(config, event->offer_video_transport));
 
         if (event->offer_video_port != 0 && event->offer_video_payload_type != 0) {
             media->accepted = 1;
@@ -118,6 +129,14 @@ static int sip_session_service_build_answer(sip_session_service_t *service,
                  ? event->offer_connection_ip
                  : event->source_ip);
     response->media.remote_ip_alt[0] = '\0';
+    snprintf(response->media.audio_transport,
+             sizeof(response->media.audio_transport),
+             "%s",
+             audio_accepted ? default_transport(config, event->offer_audio_transport) : "");
+    snprintf(response->media.video_transport,
+             sizeof(response->media.video_transport),
+             "%s",
+             video_accepted ? default_transport(config, event->offer_video_transport) : "");
     response->media.audio_port = audio_accepted ? event->offer_audio_port : 0;
     response->media.video_port = video_accepted ? event->offer_video_port : 0;
     response->media.audio_payload_type = audio_accepted ? event->offer_audio_payload_type : 0;

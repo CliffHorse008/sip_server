@@ -16,11 +16,18 @@ typedef enum {
     SIP_TRANSPORT_TCP = 1
 } sip_transport_t;
 
+/* 支持的 RTP 媒体传输方式。 */
+typedef enum {
+    RTP_TRANSPORT_UDP = 0,
+    RTP_TRANSPORT_KCP = 1
+} rtp_transport_t;
+
 /* 应用启动参数与运行期配置。 */
 typedef struct {
     char bind_ip[64];
     char media_ip[64];
     sip_transport_t sip_transport;
+    rtp_transport_t rtp_transport;
     uint16_t sip_port;
     uint16_t sip_session_expires;
     uint16_t audio_port;
@@ -42,5 +49,7 @@ void config_print_usage(FILE *stream, const char *program_name);
 const char *config_audio_codec_name(audio_codec_t codec);
 /* 返回 SIP 传输方式名称字符串。 */
 const char *config_sip_transport_name(sip_transport_t transport);
+/* 返回 RTP 传输方式名称字符串。 */
+const char *config_rtp_transport_name(rtp_transport_t transport);
 
 #endif
