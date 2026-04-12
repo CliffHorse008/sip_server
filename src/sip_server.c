@@ -22,6 +22,7 @@
 #define SIP_TRANSACTION_LIFETIME_MS (64LL * SIP_TIMER_T1_MS)
 #define SIP_MAX_INVITE_TRANSACTIONS 8
 #define SIP_MAX_TERMINATED_DIALOGS 8
+#define SIP_EXTRA_HEADERS_SIZE 1024
 
 typedef struct {
     char method[16];
@@ -40,6 +41,8 @@ typedef struct {
 typedef struct {
     int active;
     int established;
+    unsigned int session_expires;
+    long long session_expire_at_ms;
     char call_id[256];
     char from[1024];
     char to[1024];
@@ -66,7 +69,7 @@ typedef struct {
     char local_tag[32];
     int status_code;
     char reason_phrase[64];
-    char extra_headers[512];
+    char extra_headers[SIP_EXTRA_HEADERS_SIZE];
     char body[4096];
     long long next_retransmit_ms;
     long long retransmit_interval_ms;
@@ -330,6 +333,133 @@ static int parse_request(const char *message, const struct sockaddr_in *peer, si
     }
 
     request->body = get_body(message);
+    return 0;
+}
+
+static int parse_session_expires_value(const char *value, unsigned int *out)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (value == NULL || out == NULL) {
+        return -1;
+    }
+
+    parsed = strtoul(value, &end, 10);
+
+    if (value[0] == '\0' || end == NULL || *end != '\0' || parsed == 0 || parsed > 65535UL) {
+        return -1;
+    }
+
+    *out = (unsigned int) parsed;
+    return 0;
+}
+
+static int parse_session_expires_header(const char *message, unsigned int *out)
+{
+    char value[128];
+    char delta_seconds[32];
+    const char *separator;
+
+    if (!get_header_value(message, "Session-Expires", value, sizeof(value))) {
+        return 0;
+    }
+
+    separator = strchr(value, ';');
+    trim_copy(delta_seconds,
+              sizeof(delta_seconds),
+              value,
+              separator != NULL ? (size_t) (separator - value) : strlen(value));
+    if (parse_session_expires_value(delta_seconds, out) != 0) {
+        return -1;
+    }
+
+    return 1;
+}
+
+static int negotiate_session_expires(const app_config_t *config,
+                                     const char *message,
+                                     unsigned int *session_expires,
+                                     int *interval_too_small)
+{
+    unsigned int requested = 0;
+    int parsed;
+
+    *session_expires = config->sip_session_expires;
+    *interval_too_small = 0;
+
+    parsed = parse_session_expires_header(message, &requested);
+    if (parsed < 0) {
+        return -1;
+    }
+    if (parsed == 0) {
+        return 0;
+    }
+
+    if (requested < config->sip_session_expires) {
+        *interval_too_small = 1;
+        return 0;
+    }
+
+    *session_expires = requested;
+    return 0;
+}
+
+static int build_session_timer_headers(char *buffer,
+                                       size_t buffer_size,
+                                       const app_config_t *config,
+                                       unsigned int session_expires,
+                                       int include_allow,
+                                       int include_min_se)
+{
+    int written = 0;
+    int current;
+
+    if (buffer_size == 0) {
+        return -1;
+    }
+
+    buffer[0] = '\0';
+
+    if (include_allow) {
+        current = snprintf(buffer + written,
+                           buffer_size - (size_t) written,
+                           "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n");
+        if (current < 0 || (size_t) current >= buffer_size - (size_t) written) {
+            return -1;
+        }
+        written += current;
+    }
+
+    current = snprintf(buffer + written,
+                       buffer_size - (size_t) written,
+                       "Supported: timer\r\n");
+    if (current < 0 || (size_t) current >= buffer_size - (size_t) written) {
+        return -1;
+    }
+    written += current;
+
+    if (include_min_se) {
+        current = snprintf(buffer + written,
+                           buffer_size - (size_t) written,
+                           "Min-SE: %u\r\n",
+                           config->sip_session_expires);
+        if (current < 0 || (size_t) current >= buffer_size - (size_t) written) {
+            return -1;
+        }
+        written += current;
+    }
+
+    if (session_expires > 0) {
+        current = snprintf(buffer + written,
+                           buffer_size - (size_t) written,
+                           "Session-Expires: %u;refresher=uac\r\n",
+                           session_expires);
+        if (current < 0 || (size_t) current >= buffer_size - (size_t) written) {
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -869,6 +999,19 @@ static void dialog_reset(sip_dialog_t *dialog)
     memset(dialog, 0, sizeof(*dialog));
 }
 
+static void dialog_refresh_session_timer(sip_dialog_t *dialog, unsigned int session_expires)
+{
+    dialog->session_expires = session_expires;
+    dialog->session_expire_at_ms = monotonic_time_ms() + (long long) session_expires * 1000LL;
+}
+
+static int dialog_session_expired(const sip_dialog_t *dialog, long long now_ms)
+{
+    return dialog->active &&
+           dialog->session_expires != 0 &&
+           now_ms >= dialog->session_expire_at_ms;
+}
+
 static int request_has_local_tag(const sip_request_t *request, const char *local_tag)
 {
     char tag_pattern[48];
@@ -1057,9 +1200,8 @@ static invite_transaction_t *invite_transaction_alloc_slot(invite_transaction_t 
     return oldest;
 }
 
-static void dialog_init_from_request(sip_dialog_t *dialog, const sip_request_t *request)
+static void dialog_update_from_request(sip_dialog_t *dialog, const sip_request_t *request)
 {
-    dialog->active = 1;
     snprintf(dialog->call_id, sizeof(dialog->call_id), "%s", request->call_id);
     snprintf(dialog->from, sizeof(dialog->from), "%s", request->from);
     snprintf(dialog->to, sizeof(dialog->to), "%s", request->to);
@@ -1068,6 +1210,12 @@ static void dialog_init_from_request(sip_dialog_t *dialog, const sip_request_t *
     dialog->source_port = request->source_port;
     dialog->cseq = request->cseq;
     snprintf(dialog->cseq_method, sizeof(dialog->cseq_method), "%s", request->cseq_method);
+}
+
+static void dialog_init_from_request(sip_dialog_t *dialog, const sip_request_t *request)
+{
+    dialog->active = 1;
+    dialog_update_from_request(dialog, request);
 }
 
 static void emit_signal_event(const sip_server_handlers_t *handlers,
@@ -1106,6 +1254,27 @@ static void emit_signal_event(const sip_server_handlers_t *handlers,
     }
 
     handlers->on_signal(&event, handlers->user_data);
+}
+
+static void terminate_active_dialog(streamer_t *streamer,
+                                    sip_dialog_t *dialog,
+                                    terminated_dialog_t *terminated_dialogs,
+                                    const sip_server_handlers_t *handlers,
+                                    const sip_request_t *request,
+                                    const char *reason)
+{
+    if (!dialog->active) {
+        return;
+    }
+
+    fprintf(stdout,
+            "terminating dialog call_id=%s reason=%s\n",
+            dialog->call_id,
+            reason != NULL ? reason : "unspecified");
+    streamer_stop(streamer);
+    terminated_dialog_store(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, dialog);
+    emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, request, dialog, 0, NULL, NULL);
+    dialog_reset(dialog);
 }
 
 static int send_response_maybe_emit(int sock,
@@ -1388,6 +1557,44 @@ static int build_default_invite_response(const sdp_offer_t *offer,
     return 0;
 }
 
+static int build_current_session_sdp(streamer_t *streamer,
+                                     const streamer_session_params_t *media,
+                                     char *buffer,
+                                     size_t buffer_size)
+{
+    streamer_sdp_plan_t plan;
+
+    memset(&plan, 0, sizeof(plan));
+
+    if (media->audio_port != 0) {
+        streamer_sdp_media_t *audio = &plan.media[plan.media_count++];
+
+        memset(audio, 0, sizeof(*audio));
+        audio->kind = STREAMER_MEDIA_AUDIO;
+        audio->accepted = 1;
+        audio->payload_type = media->audio_payload_type;
+        audio->direction = STREAMER_DIRECTION_SENDRECV;
+        snprintf(audio->transport, sizeof(audio->transport), "%s", "RTP/AVP");
+    }
+
+    if (media->video_enabled && media->video_port != 0) {
+        streamer_sdp_media_t *video = &plan.media[plan.media_count++];
+
+        memset(video, 0, sizeof(*video));
+        video->kind = STREAMER_MEDIA_VIDEO;
+        video->accepted = 1;
+        video->payload_type = media->video_payload_type;
+        video->direction = STREAMER_DIRECTION_SENDRECV;
+        snprintf(video->transport, sizeof(video->transport), "%s", "RTP/AVP");
+    }
+
+    if (plan.media_count == 0) {
+        return -1;
+    }
+
+    return streamer_build_sdp(streamer, &plan, buffer, buffer_size);
+}
+
 static void summarize_offer_for_upper_layer(const sdp_offer_t *offer,
                                             const app_config_t *config,
                                             sip_offer_summary_t *summary)
@@ -1530,7 +1737,137 @@ static void handle_sip_message(int message_socket,
         return;
     }
 
-    if (str_case_equal(request.method, "OPTIONS") || str_case_equal(request.method, "REGISTER")) {
+    if (str_case_equal(request.method, "INVITE") && dialog_matches(dialog, &request)) {
+        unsigned int session_expires = 0;
+        int session_interval_too_small = 0;
+        char session_headers[SIP_EXTRA_HEADERS_SIZE];
+        sip_invite_response_t invite_response;
+
+        if (negotiate_session_expires(config, buffer, &session_expires, &session_interval_too_small) != 0) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   400,
+                                   "Bad Request",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            return;
+        }
+
+        if (session_interval_too_small) {
+            if (build_session_timer_headers(session_headers, sizeof(session_headers), config, 0, 0, 1) != 0) {
+                send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       500,
+                                       "Server Error",
+                                       dialog->local_tag,
+                                       config,
+                                       NULL,
+                                       NULL,
+                                       handlers,
+                                       streamer);
+                return;
+            }
+
+            if (send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       422,
+                                       "Session Interval Too Small",
+                                       dialog->local_tag,
+                                       config,
+                                       session_headers,
+                                       NULL,
+                                       handlers,
+                                       streamer) == 0) {
+                invite_transaction_store_in_table(invite_transactions,
+                                                  SIP_MAX_INVITE_TRANSACTIONS,
+                                                  &request,
+                                                  peer,
+                                                  422,
+                                                  "Session Interval Too Small",
+                                                  dialog->local_tag,
+                                                  session_headers,
+                                                  NULL);
+            }
+            return;
+        }
+
+        prepare_invite_response_defaults(config, &invite_response);
+        invite_response.accept = 1;
+        invite_response.status_code = 200;
+        snprintf(invite_response.reason_phrase, sizeof(invite_response.reason_phrase), "%s", "OK");
+        invite_response.media = dialog->media;
+
+        if (build_current_session_sdp(streamer,
+                                      &dialog->media,
+                                      invite_response.answer_sdp,
+                                      sizeof(invite_response.answer_sdp)) != 0) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   500,
+                                   "Server Error",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            return;
+        }
+
+        if (build_session_timer_headers(session_headers,
+                                        sizeof(session_headers),
+                                        config,
+                                        session_expires,
+                                        1,
+                                        1) != 0) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   500,
+                                   "Server Error",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            return;
+        }
+
+        if (send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   invite_response.status_code,
+                                   invite_response.reason_phrase,
+                                   dialog->local_tag,
+                                   config,
+                                   session_headers,
+                                   invite_response.answer_sdp,
+                                   handlers,
+                                   streamer) != 0) {
+            return;
+        }
+
+        dialog_update_from_request(dialog, &request);
+        dialog_refresh_session_timer(dialog, session_expires);
+        invite_transaction_store_in_table(invite_transactions,
+                                          SIP_MAX_INVITE_TRANSACTIONS,
+                                          &request,
+                                          peer,
+                                          invite_response.status_code,
+                                          invite_response.reason_phrase,
+                                          dialog->local_tag,
+                                          session_headers,
+                                          invite_response.answer_sdp);
+    } else if (str_case_equal(request.method, "OPTIONS") || str_case_equal(request.method, "REGISTER")) {
         char local_tag[32];
         generate_local_tag(local_tag, sizeof(local_tag));
         send_response_and_emit(message_socket,
@@ -1582,15 +1919,81 @@ static void handle_sip_message(int message_socket,
         sdp_offer_t offer;
         sip_offer_summary_t offer_summary;
         int invite_rc;
+        unsigned int session_expires = 0;
+        int session_interval_too_small = 0;
+        char session_headers[SIP_EXTRA_HEADERS_SIZE];
 
-        streamer_stop(streamer);
         if (dialog->active) {
-            terminated_dialog_store(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, dialog);
-            emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, NULL, dialog, 0, NULL, NULL);
+            terminate_active_dialog(streamer,
+                                    dialog,
+                                    terminated_dialogs,
+                                    handlers,
+                                    NULL,
+                                    "replaced by new INVITE");
+        } else {
+            streamer_stop(streamer);
         }
         dialog_reset(dialog);
         memset(invite_transactions, 0, sizeof(invite_transaction_t) * SIP_MAX_INVITE_TRANSACTIONS);
         generate_local_tag(dialog->local_tag, sizeof(dialog->local_tag));
+
+        if (negotiate_session_expires(config, buffer, &session_expires, &session_interval_too_small) != 0) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   400,
+                                   "Bad Request",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            dialog_reset(dialog);
+            return;
+        }
+
+        if (session_interval_too_small) {
+            if (build_session_timer_headers(session_headers, sizeof(session_headers), config, 0, 0, 1) != 0) {
+                send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       500,
+                                       "Server Error",
+                                       dialog->local_tag,
+                                       config,
+                                       NULL,
+                                       NULL,
+                                       handlers,
+                                       streamer);
+                dialog_reset(dialog);
+                return;
+            }
+
+            if (send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       422,
+                                       "Session Interval Too Small",
+                                       dialog->local_tag,
+                                       config,
+                                       session_headers,
+                                       NULL,
+                                       handlers,
+                                       streamer) == 0) {
+                invite_transaction_store_in_table(invite_transactions,
+                                                  SIP_MAX_INVITE_TRANSACTIONS,
+                                                  &request,
+                                                  peer,
+                                                  422,
+                                                  "Session Interval Too Small",
+                                                  dialog->local_tag,
+                                                  session_headers,
+                                                  NULL);
+            }
+            dialog_reset(dialog);
+            return;
+        }
 
         if (send_response_and_emit(message_socket,
                                    peer,
@@ -1709,6 +2112,26 @@ static void handle_sip_message(int message_socket,
 
         dialog_init_from_request(dialog, &request);
         dialog->media = invite_response.media;
+        if (build_session_timer_headers(session_headers,
+                                        sizeof(session_headers),
+                                        config,
+                                        session_expires,
+                                        1,
+                                        1) != 0) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   500,
+                                   "Server Error",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            dialog_reset(dialog);
+            return;
+        }
 
         if (invite_response.send_ringing) {
             if (send_response_and_emit(message_socket,
@@ -1734,13 +2157,14 @@ static void handle_sip_message(int message_socket,
                                    invite_response.reason_phrase,
                                    dialog->local_tag,
                                    config,
-                                   "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
+                                   session_headers,
                                    invite_response.answer_sdp,
                                    handlers,
                                    streamer) != 0) {
             dialog_reset(dialog);
             return;
         }
+        dialog_refresh_session_timer(dialog, session_expires);
         invite_transaction_store_in_table(invite_transactions,
                                           SIP_MAX_INVITE_TRANSACTIONS,
                                           &request,
@@ -1748,7 +2172,7 @@ static void handle_sip_message(int message_socket,
                                           invite_response.status_code,
                                           invite_response.reason_phrase,
                                           dialog->local_tag,
-                                          "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
+                                          session_headers,
                                           invite_response.answer_sdp);
     } else if (str_case_equal(request.method, "ACK")) {
         if (dialog_matches(dialog, &request) && !dialog->established) {
@@ -1789,9 +2213,12 @@ static void handle_sip_message(int message_socket,
                                    NULL,
                                    handlers,
                                    streamer);
-            terminated_dialog_store(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS, dialog);
-            emit_signal_event(handlers, streamer, SIP_SIGNAL_DIALOG_TERMINATED, &request, dialog, 0, NULL, NULL);
-            dialog_reset(dialog);
+            terminate_active_dialog(streamer,
+                                    dialog,
+                                    terminated_dialogs,
+                                    handlers,
+                                    &request,
+                                    "received BYE");
         } else {
             if (matched_terminated_bye == NULL) {
                 matched_terminated_bye =
@@ -1901,6 +2328,14 @@ int sip_server_run_with_handlers(const app_config_t *config,
                                                     streamer,
                                                     invite_transactions,
                                                     SIP_MAX_INVITE_TRANSACTIONS);
+            if (dialog_session_expired(&dialog, monotonic_time_ms())) {
+                terminate_active_dialog(streamer,
+                                        &dialog,
+                                        terminated_dialogs,
+                                        handlers,
+                                        NULL,
+                                        "session timer expired");
+            }
 
             received = recvfrom(sip_socket,
                                 buffer,
@@ -1943,6 +2378,14 @@ int sip_server_run_with_handlers(const app_config_t *config,
 
             terminated_dialog_table_cleanup(terminated_dialogs, SIP_MAX_TERMINATED_DIALOGS);
             invite_transaction_table_cleanup(invite_transactions, SIP_MAX_INVITE_TRANSACTIONS);
+            if (dialog_session_expired(&dialog, monotonic_time_ms())) {
+                terminate_active_dialog(streamer,
+                                        &dialog,
+                                        terminated_dialogs,
+                                        handlers,
+                                        NULL,
+                                        "session timer expired");
+            }
 
             FD_ZERO(&read_fds);
             FD_SET(sip_socket, &read_fds);
@@ -2001,6 +2444,12 @@ int sip_server_run_with_handlers(const app_config_t *config,
                                 SIP_STREAM_BUFFER_SIZE - buffered,
                                 0);
                 if (received <= 0) {
+                    terminate_active_dialog(streamer,
+                                            &dialog,
+                                            terminated_dialogs,
+                                            handlers,
+                                            NULL,
+                                            "tcp connection closed");
                     close(client_socket);
                     client_socket = -1;
                     buffered = 0;

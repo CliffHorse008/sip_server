@@ -52,6 +52,7 @@ void config_set_defaults(app_config_t *config)
     snprintf(config->media_ip, sizeof(config->media_ip), "127.0.0.1");
     config->sip_transport = SIP_TRANSPORT_UDP;
     config->sip_port = 5060;
+    config->sip_session_expires = 90;
     config->audio_port = 5004;
     config->video_port = 5006;
     config->video_fps = 30.0;
@@ -79,6 +80,7 @@ void config_print_usage(FILE *stream, const char *program_name)
             "  --media-ip <ip>       SDP announced media address, default 127.0.0.1\n"
             "  --sip-port <port>     SIP listen port, default 5060\n"
             "  --sip-transport <t>   udp or tcp, default udp\n"
+            "  --sip-session-expires <sec>  SIP Session-Expires, default 90\n"
             "  --audio-port <port>   Local RTP audio port, default 5004\n"
             "  --video-port <port>   Local RTP video port, default 5006\n"
             "  --video-fps <fps>     H264 pacing FPS, default 30.0\n"
@@ -121,6 +123,12 @@ int config_parse(app_config_t *config, int argc, char **argv)
         } else if (strcmp(arg, "--sip-transport") == 0) {
             if (parse_sip_transport(argv[++index], &config->sip_transport) != 0) {
                 fprintf(stderr, "invalid sip transport\n");
+                return -1;
+            }
+        } else if (strcmp(arg, "--sip-session-expires") == 0) {
+            if (parse_u16(argv[++index], &config->sip_session_expires) != 0 ||
+                config->sip_session_expires == 0) {
+                fprintf(stderr, "invalid sip session expires\n");
                 return -1;
             }
         } else if (strcmp(arg, "--audio-port") == 0) {

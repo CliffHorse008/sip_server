@@ -191,6 +191,7 @@ sip:test@192.168.18.126:6060;transport=tcp
 
 - `--sip-port`：SIP 监听端口，默认 `5060`
 - `--sip-transport`：SIP 信令传输方式，支持 `udp` / `tcp`，默认 `udp`
+- `--sip-session-expires`：SIP Session Timer 秒数，默认 `90`
 - `--audio-port`：本地音频 RTP 端口，默认 `5004`
 - `--video-port`：本地视频 RTP 端口，默认 `5006`
 - `--video-fps`：视频发送节奏，默认 `30`

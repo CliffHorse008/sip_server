@@ -22,6 +22,7 @@ typedef struct {
     char media_ip[64];
     sip_transport_t sip_transport;
     uint16_t sip_port;
+    uint16_t sip_session_expires;
     uint16_t audio_port;
     uint16_t video_port;
     double video_fps;
