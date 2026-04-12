@@ -942,6 +942,13 @@ static int build_sdp_plan(const sdp_offer_t *offer,
                  select_sdp_transport(offered->transport, config));
 
         if (!sdp_transport_supported(offered->transport, config) || offered->port == 0) {
+            if (offered->port != 0 && offered->transport[0] != '\0' && !sdp_transport_supported(offered->transport, config)) {
+                fprintf(stdout,
+                        "reject %s media due to transport mismatch offer=%s required=%s\n",
+                        offered->kind == STREAMER_MEDIA_AUDIO ? "audio" : "video",
+                        offered->transport,
+                        default_sdp_transport(config));
+            }
             continue;
         }
 
