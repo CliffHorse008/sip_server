@@ -206,6 +206,39 @@ static int get_header_value(const char *message, const char *header_name, char *
     return 0;
 }
 
+static int header_contains_token(const char *message, const char *header_name, const char *token)
+{
+    char value[512];
+    const char *cursor;
+
+    if (token == NULL) {
+        return 0;
+    }
+
+    if (!get_header_value(message, header_name, value, sizeof(value))) {
+        return 0;
+    }
+
+    cursor = value;
+    while (*cursor != '\0') {
+        const char *end = cursor;
+        char part[128];
+
+        while (*end != '\0' && *end != ',') {
+            ++end;
+        }
+
+        trim_copy(part, sizeof(part), cursor, (size_t) (end - cursor));
+        if (str_case_equal(part, token)) {
+            return 1;
+        }
+
+        cursor = *end == ',' ? end + 1 : end;
+    }
+
+    return 0;
+}
+
 static void extract_header_param_value(const char *header_value,
                                        const char *param_name,
                                        char *buffer,
@@ -1595,6 +1628,28 @@ static int build_current_session_sdp(streamer_t *streamer,
     return streamer_build_sdp(streamer, &plan, buffer, buffer_size);
 }
 
+static void log_session_timer_headers(const char *message)
+{
+    char session_expires[128];
+    char min_se[128];
+    int supported_timer = header_contains_token(message, "Supported", "timer");
+    int require_timer = header_contains_token(message, "Require", "timer");
+
+    if (!get_header_value(message, "Session-Expires", session_expires, sizeof(session_expires))) {
+        snprintf(session_expires, sizeof(session_expires), "%s", "(none)");
+    }
+    if (!get_header_value(message, "Min-SE", min_se, sizeof(min_se))) {
+        snprintf(min_se, sizeof(min_se), "%s", "(none)");
+    }
+
+    fprintf(stdout,
+            "session timer headers: Supported(timer)=%s Require(timer)=%s Session-Expires=%s Min-SE=%s\n",
+            supported_timer ? "yes" : "no",
+            require_timer ? "yes" : "no",
+            session_expires,
+            min_se);
+}
+
 static void summarize_offer_for_upper_layer(const sdp_offer_t *offer,
                                             const app_config_t *config,
                                             sip_offer_summary_t *summary)
@@ -1668,6 +1723,10 @@ static void handle_sip_message(int message_socket,
 
     if (!duplicate_bye_after_termination) {
         fprintf(stdout, "SIP %s from %s:%u\n", request.method, request.source_ip, request.source_port);
+    }
+
+    if (str_case_equal(request.method, "INVITE")) {
+        log_session_timer_headers(buffer);
     }
 
     if (str_case_equal(request.method, "INVITE")) {
