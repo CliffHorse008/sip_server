@@ -1,10 +1,77 @@
 #include "sipserver/sip_embed.h"
 
+#include <stdio.h>
 #include <stdlib.h>
+
+static int sip_embed_build_year(void)
+{
+    return (__DATE__[7] - '0') * 1000 + (__DATE__[8] - '0') * 100 + (__DATE__[9] - '0') * 10 + (__DATE__[10] - '0');
+}
+
+static int sip_embed_build_day(void)
+{
+    if (__DATE__[4] == ' ') {
+        return __DATE__[5] - '0';
+    }
+
+    return (__DATE__[4] - '0') * 10 + (__DATE__[5] - '0');
+}
+
+static int sip_embed_build_month(void)
+{
+    if (__DATE__[0] == 'J' && __DATE__[1] == 'a' && __DATE__[2] == 'n') {
+        return 1;
+    }
+    if (__DATE__[0] == 'F') {
+        return 2;
+    }
+    if (__DATE__[0] == 'M' && __DATE__[2] == 'r') {
+        return 3;
+    }
+    if (__DATE__[0] == 'A' && __DATE__[1] == 'p') {
+        return 4;
+    }
+    if (__DATE__[0] == 'M' && __DATE__[2] == 'y') {
+        return 5;
+    }
+    if (__DATE__[0] == 'J' && __DATE__[2] == 'n') {
+        return 6;
+    }
+    if (__DATE__[0] == 'J' && __DATE__[2] == 'l') {
+        return 7;
+    }
+    if (__DATE__[0] == 'A' && __DATE__[1] == 'u') {
+        return 8;
+    }
+    if (__DATE__[0] == 'S') {
+        return 9;
+    }
+    if (__DATE__[0] == 'O') {
+        return 10;
+    }
+    if (__DATE__[0] == 'N') {
+        return 11;
+    }
+    return 12;
+}
 
 struct sip_embed_service {
     sip_session_service_t *session;
 };
+
+const char *sip_embed_build_time(void)
+{
+    _Thread_local static char build_time[64];
+
+    snprintf(build_time,
+             sizeof(build_time),
+             "%04d年%02d月%02d日 %s",
+             sip_embed_build_year(),
+             sip_embed_build_month(),
+             sip_embed_build_day(),
+             __TIME__);
+    return build_time;
+}
 
 sip_embed_service_t *sip_embed_service_create(const app_config_t *config)
 {

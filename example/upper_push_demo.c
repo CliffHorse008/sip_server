@@ -584,6 +584,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    fprintf(stdout, "libsip buildin: %s\n", sip_embed_build_time());
+
     service = sip_embed_service_create(&config);
     if (service == NULL) {
         return 1;

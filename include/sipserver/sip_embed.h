@@ -12,6 +12,8 @@ typedef sip_session_callbacks_t sip_embed_callbacks_t;
 /* 嵌入式服务实例的前置声明。 */
 typedef struct sip_embed_service sip_embed_service_t;
 
+/* 读取 sipserver 库的编译时间。 */
+const char *sip_embed_build_time(void);
 /* 创建嵌入式服务实例。 */
 sip_embed_service_t *sip_embed_service_create(const app_config_t *config);
 /* 销毁嵌入式服务实例。 */
