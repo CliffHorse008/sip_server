@@ -247,6 +247,40 @@ static int demo_build_h264_access_units(sample_demo_media_t *demo_media)
     return demo_media->video_frame_count > 0 ? 0 : -1;
 }
 
+/* 判断一个 Access Unit 内是否包含 IDR，用于拥塞恢复后的重新起播。 */
+static int demo_h264_access_unit_has_idr(const unsigned char *data, size_t size)
+{
+    size_t start_offset;
+    size_t code_size;
+
+    if (data == NULL || size == 0) {
+        return 0;
+    }
+
+    if (!find_start_code(data, size, 0, &start_offset, &code_size)) {
+        return (data[0] & 0x1FU) == 5U;
+    }
+
+    while (1) {
+        size_t nal_offset = start_offset + code_size;
+        size_t next_offset;
+        size_t next_code_size;
+
+        if (nal_offset < size && (data[nal_offset] & 0x1FU) == 5U) {
+            return 1;
+        }
+
+        if (!find_start_code(data, size, nal_offset, &next_offset, &next_code_size)) {
+            break;
+        }
+
+        start_offset = next_offset;
+        code_size = next_code_size;
+    }
+
+    return 0;
+}
+
 /* 由示例线程向当前会话投递一帧音频。 */
 static int sample_host_push_audio_frame(sample_host_t *host,
                                         const uint8_t *payload,
@@ -306,6 +340,7 @@ static void *sample_demo_audio_thread_main(void *opaque)
     size_t offset = 0;
     uint32_t timestamp = 0;
     int announced = 0;
+    int paused_for_backpressure = 0;
 
     while (g_stop == 0) {
         int stream_active;
@@ -313,6 +348,7 @@ static void *sample_demo_audio_thread_main(void *opaque)
         sip_embed_service_get_stream_state(host->service, &stream_active, &generation);
         if (!stream_active || demo_media->audio_blob == NULL || demo_media->audio_blob_size == 0) {
             announced = 0;
+            paused_for_backpressure = 0;
             sleep_ns(20000000LL);
             continue;
         }
@@ -324,6 +360,20 @@ static void *sample_demo_audio_thread_main(void *opaque)
 
         if (offset >= demo_media->audio_blob_size) {
             offset = 0;
+        }
+
+        if (sip_embed_service_audio_backpressure_high(host->service)) {
+            if (!paused_for_backpressure) {
+                fprintf(stdout, "demo audio push paused due to KCP backlog\n");
+                paused_for_backpressure = 1;
+            }
+            sleep_ns(20000000LL);
+            continue;
+        }
+
+        if (paused_for_backpressure) {
+            fprintf(stdout, "demo audio push resumed after KCP backlog recovered\n");
+            paused_for_backpressure = 0;
         }
 
         {
@@ -354,6 +404,7 @@ static void *sample_demo_audio_thread_main(void *opaque)
                 offset = 0;
                 timestamp = 0;
                 announced = 0;
+                paused_for_backpressure = 0;
             }
         }
     }
@@ -372,6 +423,7 @@ static void *sample_demo_video_thread_main(void *opaque)
     long long frame_interval_ns = (long long) (1000000000.0 / host->config->video_fps);
     uint32_t timestamp_step = (uint32_t) (90000.0 / host->config->video_fps);
     int announced = 0;
+    int waiting_for_idr = 0;
 
     if (frame_interval_ns <= 0) {
         frame_interval_ns = 33333333LL;
@@ -386,6 +438,7 @@ static void *sample_demo_video_thread_main(void *opaque)
         sip_embed_service_get_stream_state(host->service, &stream_active, &generation);
         if (!stream_active || demo_media->video_frames == NULL || demo_media->video_frame_count == 0) {
             announced = 0;
+            waiting_for_idr = 0;
             sleep_ns(10000000LL);
             continue;
         }
@@ -401,9 +454,28 @@ static void *sample_demo_video_thread_main(void *opaque)
 
         {
             const h264_access_unit_t *access_unit = &demo_media->video_frames[frame_index];
+            const unsigned char *access_unit_data = demo_media->video_blob + access_unit->offset;
+            int backlog_high = sip_embed_service_video_backpressure_high(host->service);
+            int is_idr = demo_h264_access_unit_has_idr(access_unit_data, access_unit->size);
 
-            if (sample_host_push_video_frame(host, demo_media->video_blob + access_unit->offset, access_unit->size, timestamp) ==
-                0) {
+            if (backlog_high && !waiting_for_idr) {
+                fprintf(stdout, "demo video push paused due to KCP backlog, wait for next IDR\n");
+                waiting_for_idr = 1;
+            }
+
+            if (waiting_for_idr) {
+                if (backlog_high || !is_idr) {
+                    ++frame_index;
+                    timestamp += timestamp_step;
+                    sleep_ns(frame_interval_ns);
+                    continue;
+                }
+
+                fprintf(stdout, "demo video push resumed on IDR frame\n");
+                waiting_for_idr = 0;
+            }
+
+            if (sample_host_push_video_frame(host, access_unit_data, access_unit->size, timestamp) == 0) {
                 ++frame_index;
                 timestamp += timestamp_step;
             }
@@ -422,6 +494,7 @@ static void *sample_demo_video_thread_main(void *opaque)
                 frame_index = 0;
                 timestamp = 0;
                 announced = 0;
+                waiting_for_idr = 0;
             }
         }
     }

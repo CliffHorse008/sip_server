@@ -24,6 +24,10 @@ void sip_embed_service_set_callbacks(sip_embed_service_t *service, const sip_emb
 int sip_embed_service_run(sip_embed_service_t *service, volatile sig_atomic_t *stop_flag);
 /* 读取当前会话状态与代数，便于宿主同步推流状态。 */
 void sip_embed_service_get_stream_state(sip_embed_service_t *service, int *stream_active, unsigned int *generation);
+/* 查询当前音频发送侧是否存在较高的 KCP 待发积压。 */
+int sip_embed_service_audio_backpressure_high(sip_embed_service_t *service);
+/* 查询当前视频发送侧是否存在较高的 KCP 待发积压。 */
+int sip_embed_service_video_backpressure_high(sip_embed_service_t *service);
 /* 向当前活动会话投递一帧音频。 */
 int sip_embed_service_push_audio_frame(sip_embed_service_t *service,
                                        const uint8_t *payload,

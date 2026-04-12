@@ -100,6 +100,10 @@ int streamer_start(streamer_t *streamer, const streamer_session_params_t *params
 int streamer_push_audio_frame(streamer_t *streamer, const streamer_audio_frame_t *frame);
 /* 线程安全地推送视频帧。 */
 int streamer_push_video_frame(streamer_t *streamer, const streamer_video_frame_t *frame);
+/* 查询音频发送侧是否存在较高的 KCP 待发积压。 */
+int streamer_audio_backpressure_high(streamer_t *streamer);
+/* 查询视频发送侧是否存在较高的 KCP 待发积压。 */
+int streamer_video_backpressure_high(streamer_t *streamer);
 /* 停止媒体发送与接收。 */
 void streamer_stop(streamer_t *streamer);
 /* 根据协商计划构造 SDP Answer。 */

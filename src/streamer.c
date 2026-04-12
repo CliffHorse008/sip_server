@@ -25,8 +25,8 @@
 #define DEFAULT_H264_PROFILE_LEVEL_ID "42E01F"
 #define KCP_AUDIO_CONV 0x41554430U
 #define KCP_VIDEO_CONV 0x56494430U
-#define KCP_WAITSND_WARN_THRESHOLD 64
-#define KCP_WAITSND_WARN_CLEAR_THRESHOLD 32
+#define KCP_WAITSND_WARN_THRESHOLD 256
+#define KCP_WAITSND_WARN_CLEAR_THRESHOLD 128
 #define KCP_WAITSND_WARN_INTERVAL_MS 1000U
 
 typedef struct media_transport_state media_transport_state_t;
@@ -189,6 +189,72 @@ static int kcp_output_callback(const char *buf, int len, ikcpcb *kcp, void *user
     return transport_send_raw_locked(state, (const unsigned char *) buf, (size_t) len);
 }
 
+static int media_transport_create_kcp_locked(media_transport_state_t *state)
+{
+    ikcpcb *kcp;
+
+    if (state == NULL || !state->use_kcp) {
+        return 0;
+    }
+
+    kcp = ikcp_create(state->kcp_conv, state);
+    if (kcp == NULL) {
+        return -1;
+    }
+
+    ikcp_setoutput(kcp, kcp_output_callback);
+    ikcp_setmtu(kcp, 1400);
+    ikcp_wndsize(kcp, 256, 256);
+    ikcp_nodelay(kcp, 1, 20, 2, 1);
+    state->kcp = kcp;
+    state->kcp_waitsnd_high = 0;
+    state->kcp_waitsnd_last_warn_ms = 0;
+    return 0;
+}
+
+static int media_transport_update_kcp_backlog_locked(media_transport_state_t *state)
+{
+    int waitsnd;
+    uint32_t now_ms;
+
+    if (state == NULL || !state->use_kcp || state->kcp == NULL) {
+        return 0;
+    }
+
+    ikcp_update(state->kcp, monotonic_time_ms32());
+    waitsnd = ikcp_waitsnd(state->kcp);
+    now_ms = monotonic_time_ms32();
+    if (waitsnd > KCP_WAITSND_WARN_THRESHOLD) {
+        if (!state->kcp_waitsnd_high ||
+            (uint32_t) (now_ms - state->kcp_waitsnd_last_warn_ms) >= KCP_WAITSND_WARN_INTERVAL_MS) {
+            char remote_ip[64];
+
+            sockaddr_to_ip_string(&state->remote_addr, remote_ip, sizeof(remote_ip));
+            fprintf(stdout,
+                    "kcp %s backlog high waitsnd=%d threshold=%d conv=0x%08x remote=%s:%u\n",
+                    state->label[0] != '\0' ? state->label : "media",
+                    waitsnd,
+                    KCP_WAITSND_WARN_THRESHOLD,
+                    state->kcp_conv,
+                    remote_ip,
+                    ntohs(state->remote_addr.sin_port));
+            state->kcp_waitsnd_last_warn_ms = now_ms;
+        }
+        state->kcp_waitsnd_high = 1;
+    } else if (state->kcp_waitsnd_high && waitsnd <= KCP_WAITSND_WARN_CLEAR_THRESHOLD) {
+        fprintf(stdout,
+                "kcp %s backlog recovered waitsnd=%d clear_threshold=%d conv=0x%08x\n",
+                state->label[0] != '\0' ? state->label : "media",
+                waitsnd,
+                KCP_WAITSND_WARN_CLEAR_THRESHOLD,
+                state->kcp_conv);
+        state->kcp_waitsnd_high = 0;
+        state->kcp_waitsnd_last_warn_ms = 0;
+    }
+
+    return waitsnd > KCP_WAITSND_WARN_THRESHOLD;
+}
+
 static int media_transport_state_init(media_transport_state_t *state, int socket_fd, const char *label)
 {
     memset(state, 0, sizeof(*state));
@@ -238,8 +304,6 @@ static int media_transport_state_configure(media_transport_state_t *state,
                                            uint16_t remote_port,
                                            uint32_t kcp_conv)
 {
-    ikcpcb *kcp = NULL;
-
     if (state == NULL || remote_ip == NULL || remote_ip[0] == '\0' || remote_port == 0) {
         return -1;
     }
@@ -272,19 +336,12 @@ static int media_transport_state_configure(media_transport_state_t *state,
         return 0;
     }
 
-    kcp = ikcp_create(kcp_conv, state);
-    if (kcp == NULL) {
+    if (media_transport_create_kcp_locked(state) != 0) {
         state->has_remote = 0;
         state->has_alt_remote = 0;
         pthread_mutex_unlock(&state->mutex);
         return -1;
     }
-
-    ikcp_setoutput(kcp, kcp_output_callback);
-    ikcp_setmtu(kcp, 1400);
-    ikcp_wndsize(kcp, 128, 128);
-    ikcp_nodelay(kcp, 1, 20, 2, 1);
-    state->kcp = kcp;
     pthread_mutex_unlock(&state->mutex);
     return 0;
 }
@@ -297,7 +354,7 @@ static void media_transport_tick(media_transport_state_t *state)
 
     pthread_mutex_lock(&state->mutex);
     if (state->use_kcp && state->kcp != NULL) {
-        ikcp_update(state->kcp, monotonic_time_ms32());
+        media_transport_update_kcp_backlog_locked(state);
     }
     pthread_mutex_unlock(&state->mutex);
 }
@@ -329,39 +386,8 @@ static int media_transport_send_packet(media_transport_state_t *state,
     ikcp_update(state->kcp, monotonic_time_ms32());
     rc = ikcp_send(state->kcp, (const char *) packet, (int) packet_size);
     if (rc >= 0) {
-        int waitsnd;
-        uint32_t now_ms;
-
         ikcp_flush(state->kcp);
-        waitsnd = ikcp_waitsnd(state->kcp);
-        now_ms = monotonic_time_ms32();
-        if (waitsnd > KCP_WAITSND_WARN_THRESHOLD) {
-            if (!state->kcp_waitsnd_high ||
-                (uint32_t) (now_ms - state->kcp_waitsnd_last_warn_ms) >= KCP_WAITSND_WARN_INTERVAL_MS) {
-                char remote_ip[64];
-
-                sockaddr_to_ip_string(&state->remote_addr, remote_ip, sizeof(remote_ip));
-                fprintf(stdout,
-                        "kcp %s backlog high waitsnd=%d threshold=%d conv=0x%08x remote=%s:%u\n",
-                        state->label[0] != '\0' ? state->label : "media",
-                        waitsnd,
-                        KCP_WAITSND_WARN_THRESHOLD,
-                        state->kcp_conv,
-                        remote_ip,
-                        ntohs(state->remote_addr.sin_port));
-                state->kcp_waitsnd_last_warn_ms = now_ms;
-            }
-            state->kcp_waitsnd_high = 1;
-        } else if (state->kcp_waitsnd_high && waitsnd <= KCP_WAITSND_WARN_CLEAR_THRESHOLD) {
-            fprintf(stdout,
-                    "kcp %s backlog recovered waitsnd=%d clear_threshold=%d conv=0x%08x\n",
-                    state->label[0] != '\0' ? state->label : "media",
-                    waitsnd,
-                    KCP_WAITSND_WARN_CLEAR_THRESHOLD,
-                    state->kcp_conv);
-            state->kcp_waitsnd_high = 0;
-            state->kcp_waitsnd_last_warn_ms = 0;
-        }
+        media_transport_update_kcp_backlog_locked(state);
         rc = 0;
     } else {
         rc = -1;
@@ -432,21 +458,16 @@ static media_frame_queue_t *media_queue_create(size_t max_depth)
     return queue;
 }
 
-static void media_queue_wake_and_stop(media_frame_queue_t *queue)
-{
-    pthread_mutex_lock(&queue->mutex);
-    queue->stopped = 1;
-    pthread_cond_broadcast(&queue->cond);
-    pthread_mutex_unlock(&queue->mutex);
-}
-
-static void media_queue_reset(media_frame_queue_t *queue)
+static void media_queue_drop_all(media_frame_queue_t *queue)
 {
     media_frame_t *node;
     media_frame_t *next;
 
+    if (queue == NULL) {
+        return;
+    }
+
     pthread_mutex_lock(&queue->mutex);
-    queue->stopped = 0;
     node = queue->head;
     queue->head = NULL;
     queue->tail = NULL;
@@ -459,6 +480,22 @@ static void media_queue_reset(media_frame_queue_t *queue)
         free(node);
         node = next;
     }
+}
+
+static void media_queue_wake_and_stop(media_frame_queue_t *queue)
+{
+    pthread_mutex_lock(&queue->mutex);
+    queue->stopped = 1;
+    pthread_cond_broadcast(&queue->cond);
+    pthread_mutex_unlock(&queue->mutex);
+}
+
+static void media_queue_reset(media_frame_queue_t *queue)
+{
+    pthread_mutex_lock(&queue->mutex);
+    queue->stopped = 0;
+    pthread_mutex_unlock(&queue->mutex);
+    media_queue_drop_all(queue);
 }
 
 static void media_queue_destroy(media_frame_queue_t *queue)
@@ -505,15 +542,10 @@ static int media_queue_push(media_frame_queue_t *queue, const uint8_t *data, siz
     }
 
     if (queue->depth >= queue->max_depth && queue->head != NULL) {
-        media_frame_t *dropped = queue->head;
-
-        queue->head = dropped->next;
-        if (queue->head == NULL) {
-            queue->tail = NULL;
-        }
-        --queue->depth;
-        free(dropped->data);
-        free(dropped);
+        pthread_mutex_unlock(&queue->mutex);
+        free(node->data);
+        free(node);
+        return -1;
     }
 
     if (queue->tail == NULL) {
@@ -603,6 +635,34 @@ int streamer_push_video_frame(streamer_t *streamer, const streamer_video_frame_t
     }
 
     return media_queue_push(streamer->video_queue_ptr, frame->data, frame->size, frame->timestamp);
+}
+
+int streamer_audio_backpressure_high(streamer_t *streamer)
+{
+    int high = 0;
+
+    if (streamer == NULL || streamer->audio_transport_state_ptr == NULL) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&streamer->audio_transport_state_ptr->mutex);
+    high = media_transport_update_kcp_backlog_locked(streamer->audio_transport_state_ptr);
+    pthread_mutex_unlock(&streamer->audio_transport_state_ptr->mutex);
+    return high;
+}
+
+int streamer_video_backpressure_high(streamer_t *streamer)
+{
+    int high = 0;
+
+    if (streamer == NULL || streamer->video_transport_state_ptr == NULL) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&streamer->video_transport_state_ptr->mutex);
+    high = media_transport_update_kcp_backlog_locked(streamer->video_transport_state_ptr);
+    pthread_mutex_unlock(&streamer->video_transport_state_ptr->mutex);
+    return high;
 }
 
 static int rtp_send_packet(rtp_context_t *context,
@@ -1007,6 +1067,7 @@ static void *video_thread_main(void *opaque)
                 break;
             }
             media_frame_release(&frame);
+
             continue;
         }
     }

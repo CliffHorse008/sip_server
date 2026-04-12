@@ -138,6 +138,42 @@ void sip_embed_service_get_stream_state(sip_embed_service_t *service, int *strea
     sip_session_service_get_stream_state(service->session, stream_active, generation);
 }
 
+int sip_embed_service_audio_backpressure_high(sip_embed_service_t *service)
+{
+    streamer_t *streamer;
+    unsigned int generation;
+
+    if (service == NULL) {
+        return 0;
+    }
+
+    streamer = sip_session_service_get_stream(service->session, &generation);
+    (void) generation;
+    if (streamer == NULL) {
+        return 0;
+    }
+
+    return streamer_audio_backpressure_high(streamer);
+}
+
+int sip_embed_service_video_backpressure_high(sip_embed_service_t *service)
+{
+    streamer_t *streamer;
+    unsigned int generation;
+
+    if (service == NULL) {
+        return 0;
+    }
+
+    streamer = sip_session_service_get_stream(service->session, &generation);
+    (void) generation;
+    if (streamer == NULL) {
+        return 0;
+    }
+
+    return streamer_video_backpressure_high(streamer);
+}
+
 int sip_embed_service_push_audio_frame(sip_embed_service_t *service,
                                        const uint8_t *payload,
                                        size_t payload_size,
