@@ -25,6 +25,9 @@
 #define DEFAULT_H264_PROFILE_LEVEL_ID "42E01F"
 #define KCP_AUDIO_CONV 0x41554430U
 #define KCP_VIDEO_CONV 0x56494430U
+#define KCP_WAITSND_WARN_THRESHOLD 64
+#define KCP_WAITSND_WARN_CLEAR_THRESHOLD 32
+#define KCP_WAITSND_WARN_INTERVAL_MS 1000U
 
 typedef struct media_transport_state media_transport_state_t;
 
@@ -92,6 +95,9 @@ struct media_transport_state {
     uint32_t kcp_conv;
     ikcpcb *kcp;
     pthread_mutex_t mutex;
+    char label[16];
+    int kcp_waitsnd_high;
+    uint32_t kcp_waitsnd_last_warn_ms;
 };
 
 void streamer_stop(streamer_t *streamer);
@@ -183,10 +189,13 @@ static int kcp_output_callback(const char *buf, int len, ikcpcb *kcp, void *user
     return transport_send_raw_locked(state, (const unsigned char *) buf, (size_t) len);
 }
 
-static int media_transport_state_init(media_transport_state_t *state, int socket_fd)
+static int media_transport_state_init(media_transport_state_t *state, int socket_fd, const char *label)
 {
     memset(state, 0, sizeof(*state));
     state->socket_fd = socket_fd;
+    if (label != NULL) {
+        snprintf(state->label, sizeof(state->label), "%s", label);
+    }
     return pthread_mutex_init(&state->mutex, NULL);
 }
 
@@ -205,6 +214,8 @@ static void media_transport_state_reset(media_transport_state_t *state)
     state->has_remote = 0;
     state->has_alt_remote = 0;
     state->kcp_conv = 0;
+    state->kcp_waitsnd_high = 0;
+    state->kcp_waitsnd_last_warn_ms = 0;
     memset(&state->remote_addr, 0, sizeof(state->remote_addr));
     memset(&state->alt_remote_addr, 0, sizeof(state->alt_remote_addr));
     pthread_mutex_unlock(&state->mutex);
@@ -318,7 +329,39 @@ static int media_transport_send_packet(media_transport_state_t *state,
     ikcp_update(state->kcp, monotonic_time_ms32());
     rc = ikcp_send(state->kcp, (const char *) packet, (int) packet_size);
     if (rc >= 0) {
+        int waitsnd;
+        uint32_t now_ms;
+
         ikcp_flush(state->kcp);
+        waitsnd = ikcp_waitsnd(state->kcp);
+        now_ms = monotonic_time_ms32();
+        if (waitsnd > KCP_WAITSND_WARN_THRESHOLD) {
+            if (!state->kcp_waitsnd_high ||
+                (uint32_t) (now_ms - state->kcp_waitsnd_last_warn_ms) >= KCP_WAITSND_WARN_INTERVAL_MS) {
+                char remote_ip[64];
+
+                sockaddr_to_ip_string(&state->remote_addr, remote_ip, sizeof(remote_ip));
+                fprintf(stdout,
+                        "kcp %s backlog high waitsnd=%d threshold=%d conv=0x%08x remote=%s:%u\n",
+                        state->label[0] != '\0' ? state->label : "media",
+                        waitsnd,
+                        KCP_WAITSND_WARN_THRESHOLD,
+                        state->kcp_conv,
+                        remote_ip,
+                        ntohs(state->remote_addr.sin_port));
+                state->kcp_waitsnd_last_warn_ms = now_ms;
+            }
+            state->kcp_waitsnd_high = 1;
+        } else if (state->kcp_waitsnd_high && waitsnd <= KCP_WAITSND_WARN_CLEAR_THRESHOLD) {
+            fprintf(stdout,
+                    "kcp %s backlog recovered waitsnd=%d clear_threshold=%d conv=0x%08x\n",
+                    state->label[0] != '\0' ? state->label : "media",
+                    waitsnd,
+                    KCP_WAITSND_WARN_CLEAR_THRESHOLD,
+                    state->kcp_conv);
+            state->kcp_waitsnd_high = 0;
+            state->kcp_waitsnd_last_warn_ms = 0;
+        }
         rc = 0;
     } else {
         rc = -1;
@@ -1097,8 +1140,12 @@ streamer_t *streamer_create(const app_config_t *config)
     }
 
     {
-        int audio_state_ready = media_transport_state_init(streamer->audio_transport_state_ptr, streamer->audio_socket_fd) == 0;
-        int video_state_ready = media_transport_state_init(streamer->video_transport_state_ptr, streamer->video_socket_fd) == 0;
+        int audio_state_ready = media_transport_state_init(streamer->audio_transport_state_ptr,
+                                                           streamer->audio_socket_fd,
+                                                           "audio") == 0;
+        int video_state_ready = media_transport_state_init(streamer->video_transport_state_ptr,
+                                                           streamer->video_socket_fd,
+                                                           "video") == 0;
 
         if (!audio_state_ready || !video_state_ready) {
             if (audio_state_ready) {
