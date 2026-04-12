@@ -24,7 +24,7 @@ add_executable(sipserver_upper_push_demo
 
 target_include_directories(sipserver
     PUBLIC include
-    PRIVATE src
+    PRIVATE src src/internal
 )
 target_include_directories(sipserver_upper_push_demo PRIVATE include)
 
