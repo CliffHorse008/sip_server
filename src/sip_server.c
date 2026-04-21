@@ -2645,6 +2645,12 @@ int sip_server_run_with_handlers(const app_config_t *config,
         }
     }
 
+    terminate_active_dialog(streamer,
+                            &dialog,
+                            terminated_dialogs,
+                            handlers,
+                            NULL,
+                            "service stopping");
     streamer_stop(streamer);
     streamer_destroy(streamer);
     close(sip_socket);
