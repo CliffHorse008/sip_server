@@ -207,10 +207,9 @@ sip:test@192.168.18.126:6060;transport=tcp
 - `--sip-session-expires`：SIP Session Timer 秒数，默认 `90`
 - `--audio-port`：本地音频 RTP 端口，默认 `5004`
 - `--video-port`：本地视频 RTP 端口，默认 `5006`
-- `--video-fps`：视频发送节奏，默认 `30`
-- `--video-file`：H264 裸流文件
-- `--aac-file`：AAC ADTS 文件
-- `--g711a-file`：G711A 原始文件
+- `--video-fps`：示例程序的视频发送节奏，默认 `30`
+- `--video-file`：示例程序读取的 H264 裸流文件
+- `--g711a-file`：示例程序读取的 G711A 原始文件
 
 ## 联调说明
 

@@ -15,6 +15,14 @@
 
 static volatile sig_atomic_t g_stop = 0;
 
+/* 示例程序自己的配置，公共 SIP/RTP 配置之外的字段不进入库 API。 */
+typedef struct {
+    app_config_t app;
+    double video_fps;
+    char video_path[256];
+    char g711a_path[256];
+} sample_config_t;
+
 /* 一个 H264 Access Unit 在裸码流中的偏移与长度。 */
 typedef struct {
     size_t offset;
@@ -37,7 +45,7 @@ typedef struct {
 
 /* 示例宿主上下文，包含嵌入式服务实例与演示媒体状态。 */
 typedef struct {
-    const app_config_t *config;
+    const sample_config_t *config;
     sip_embed_service_t *service;
     sample_demo_media_t demo_media;
     pthread_mutex_t media_log_mutex;
@@ -76,6 +84,108 @@ static long long monotonic_time_ms(void)
 
     gettimeofday(&tv, NULL);
     return (long long) tv.tv_sec * 1000LL + (long long) tv.tv_usec / 1000LL;
+}
+
+static int parse_double_value(const char *value, double *out)
+{
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+
+    if (value[0] == '\0' || end == NULL || *end != '\0') {
+        return -1;
+    }
+
+    *out = parsed;
+    return 0;
+}
+
+static void sample_config_set_defaults(sample_config_t *config)
+{
+    memset(config, 0, sizeof(*config));
+    config_set_defaults(&config->app);
+    config->video_fps = 30.0;
+    snprintf(config->video_path, sizeof(config->video_path), "test_media/video.h264");
+    snprintf(config->g711a_path, sizeof(config->g711a_path), "test_media/audio.g711a");
+}
+
+static void sample_config_print_usage(FILE *stream, const char *program_name)
+{
+    config_print_usage(stream, program_name);
+    fprintf(stream,
+            "Demo options:\n"
+            "  --video-fps <fps>     H264 pacing FPS, default 30.0\n"
+            "  --video-file <path>   H264 Annex-B bitstream path\n"
+            "  --g711a-file <path>   G711A raw payload path\n");
+}
+
+static int sample_config_parse(sample_config_t *config, int argc, char **argv)
+{
+    char **app_argv;
+    int app_argc = 1;
+    int index;
+    int parse_rc;
+
+    sample_config_set_defaults(config);
+
+    app_argv = (char **) malloc(sizeof(*app_argv) * (size_t) argc);
+    if (app_argv == NULL) {
+        fprintf(stderr, "failed to allocate argv buffer\n");
+        return -1;
+    }
+
+    app_argv[0] = argv[0];
+    for (index = 1; index < argc; ++index) {
+        const char *arg = argv[index];
+
+        if (strcmp(arg, "--help") == 0) {
+            sample_config_print_usage(stdout, argv[0]);
+            free(app_argv);
+            return 1;
+        }
+
+        if (strcmp(arg, "--video-fps") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "missing value for option: %s\n", arg);
+                free(app_argv);
+                return -1;
+            }
+            if (parse_double_value(argv[++index], &config->video_fps) != 0 || config->video_fps <= 0.0) {
+                fprintf(stderr, "invalid video fps\n");
+                free(app_argv);
+                return -1;
+            }
+            continue;
+        }
+
+        if (strcmp(arg, "--video-file") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "missing value for option: %s\n", arg);
+                free(app_argv);
+                return -1;
+            }
+            snprintf(config->video_path, sizeof(config->video_path), "%s", argv[++index]);
+            continue;
+        }
+
+        if (strcmp(arg, "--g711a-file") == 0) {
+            if (index + 1 >= argc) {
+                fprintf(stderr, "missing value for option: %s\n", arg);
+                free(app_argv);
+                return -1;
+            }
+            snprintf(config->g711a_path, sizeof(config->g711a_path), "%s", argv[++index]);
+            continue;
+        }
+
+        app_argv[app_argc++] = argv[index];
+        if (index + 1 < argc) {
+            app_argv[app_argc++] = argv[++index];
+        }
+    }
+
+    parse_rc = config_parse(&config->app, app_argc, app_argv);
+    free(app_argv);
+    return parse_rc;
 }
 
 /* 一次性把整个文件读入内存，用于测试媒体加载。 */
@@ -318,7 +428,7 @@ static int sample_demo_media_load(sample_host_t *host)
         fprintf(stderr, "failed to load video file: %s\n", host->config->video_path);
     }
 
-    if (host->config->audio_codec == AUDIO_CODEC_G711A) {
+    if (host->config->app.audio_codec == AUDIO_CODEC_G711A) {
         if (read_entire_file(host->config->g711a_path, &demo_media->audio_blob, &demo_media->audio_blob_size) != 0) {
             fprintf(stderr, "failed to load G711A file: %s\n", host->config->g711a_path);
         }
@@ -613,7 +723,7 @@ static void sample_host_destroy(sample_host_t *host)
 }
 
 /* 初始化示例宿主，并启动本地演示推流线程。 */
-static int sample_host_init(sample_host_t *host, const app_config_t *config, sip_embed_service_t *service)
+static int sample_host_init(sample_host_t *host, const sample_config_t *config, sip_embed_service_t *service)
 {
     memset(host, 0, sizeof(*host));
     host->config = config;
@@ -638,7 +748,7 @@ static int sample_host_init(sample_host_t *host, const app_config_t *config, sip
 
 int main(int argc, char **argv)
 {
-    app_config_t config;
+    sample_config_t config;
     sample_host_t host;
     sip_embed_service_t *service;
     sip_embed_callbacks_t callbacks;
@@ -648,18 +758,18 @@ int main(int argc, char **argv)
     srand((unsigned int) time(NULL));
 
     /* 先解析命令行；帮助信息与参数错误在这里直接返回。 */
-    parse_rc = config_parse(&config, argc, argv);
+    parse_rc = sample_config_parse(&config, argc, argv);
     if (parse_rc > 0) {
         return 0;
     }
     if (parse_rc < 0) {
-        config_print_usage(stderr, argv[0]);
+        sample_config_print_usage(stderr, argv[0]);
         return 1;
     }
 
     fprintf(stdout, "libsip buildin: %s\n", sip_embed_build_time());
 
-    service = sip_embed_service_create(&config);
+    service = sip_embed_service_create(&config.app);
     if (service == NULL) {
         return 1;
     }
@@ -679,12 +789,12 @@ int main(int argc, char **argv)
 
     fprintf(stdout,
             "sipserver starting on %s:%u/%s, media=%s, rtp_transport=%s, audio_codec=%s, mode=upper-push-demo\n",
-            config.bind_ip,
-            config.sip_port,
-            config_sip_transport_name(config.sip_transport),
-            config.media_ip,
-            config_rtp_transport_name(config.rtp_transport),
-            config_audio_codec_name(config.audio_codec));
+            config.app.bind_ip,
+            config.app.sip_port,
+            config_sip_transport_name(config.app.sip_transport),
+            config.app.media_ip,
+            config_rtp_transport_name(config.app.rtp_transport),
+            config_audio_codec_name(config.app.audio_codec));
 
     run_rc = sip_embed_service_run(service, &g_stop);
     g_stop = 1;

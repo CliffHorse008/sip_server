@@ -32,11 +32,7 @@ typedef struct {
     uint16_t sip_session_expires;
     uint16_t audio_port;
     uint16_t video_port;
-    double video_fps;
     audio_codec_t audio_codec;
-    char video_path[256];
-    char aac_path[256];
-    char g711a_path[256];
 } app_config_t;
 
 /* 填充默认配置。 */

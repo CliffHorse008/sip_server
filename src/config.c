@@ -17,19 +17,6 @@ static int parse_u16(const char *value, uint16_t *out)
     return 0;
 }
 
-static int parse_double_value(const char *value, double *out)
-{
-    char *end = NULL;
-    double parsed = strtod(value, &end);
-
-    if (value[0] == '\0' || end == NULL || *end != '\0') {
-        return -1;
-    }
-
-    *out = parsed;
-    return 0;
-}
-
 static int parse_sip_transport(const char *value, sip_transport_t *out)
 {
     if (strcmp(value, "udp") == 0) {
@@ -70,11 +57,7 @@ void config_set_defaults(app_config_t *config)
     config->sip_session_expires = 90;
     config->audio_port = 5004;
     config->video_port = 5006;
-    config->video_fps = 30.0;
     config->audio_codec = AUDIO_CODEC_AAC;
-    snprintf(config->video_path, sizeof(config->video_path), "test_media/video.h264");
-    snprintf(config->aac_path, sizeof(config->aac_path), "test_media/audio.aac");
-    snprintf(config->g711a_path, sizeof(config->g711a_path), "test_media/audio.g711a");
 }
 
 const char *config_audio_codec_name(audio_codec_t codec)
@@ -104,11 +87,7 @@ void config_print_usage(FILE *stream, const char *program_name)
             "  --sip-session-expires <sec>  SIP Session-Expires, default 90\n"
             "  --audio-port <port>   Local RTP audio port, default 5004\n"
             "  --video-port <port>   Local RTP video port, default 5006\n"
-            "  --video-fps <fps>     H264 pacing FPS, default 30.0\n"
             "  --audio-codec <name>  aac or g711a, default aac\n"
-            "  --video-file <path>   H264 Annex-B bitstream path\n"
-            "  --aac-file <path>     AAC ADTS bitstream path\n"
-            "  --g711a-file <path>   G711A raw payload path\n"
             "  --help                Show this help\n",
             program_name);
 }
@@ -167,11 +146,6 @@ int config_parse(app_config_t *config, int argc, char **argv)
                 fprintf(stderr, "invalid video port\n");
                 return -1;
             }
-        } else if (strcmp(arg, "--video-fps") == 0) {
-            if (parse_double_value(argv[++index], &config->video_fps) != 0 || config->video_fps <= 0.0) {
-                fprintf(stderr, "invalid video fps\n");
-                return -1;
-            }
         } else if (strcmp(arg, "--audio-codec") == 0) {
             const char *codec = argv[++index];
             if (strcmp(codec, "aac") == 0) {
@@ -182,12 +156,6 @@ int config_parse(app_config_t *config, int argc, char **argv)
                 fprintf(stderr, "unsupported audio codec: %s\n", codec);
                 return -1;
             }
-        } else if (strcmp(arg, "--video-file") == 0) {
-            snprintf(config->video_path, sizeof(config->video_path), "%s", argv[++index]);
-        } else if (strcmp(arg, "--aac-file") == 0) {
-            snprintf(config->aac_path, sizeof(config->aac_path), "%s", argv[++index]);
-        } else if (strcmp(arg, "--g711a-file") == 0) {
-            snprintf(config->g711a_path, sizeof(config->g711a_path), "%s", argv[++index]);
         } else {
             fprintf(stderr, "unknown option: %s\n", arg);
             return -1;
