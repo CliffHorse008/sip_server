@@ -713,6 +713,31 @@ static void sample_host_on_media(const streamer_rtp_packet_t *packet, void *user
     }
 }
 
+static void sample_host_on_signal(const sip_signal_event_t *event, void *user_data)
+{
+    sample_host_t *host = (sample_host_t *) user_data;
+
+    (void) host;
+    if (event->type == SIP_SIGNAL_RESPONSE_SENT) {
+        fprintf(stdout,
+                "app signal response call_id=%s status=%d reason=%s\n",
+                event->call_id != NULL ? event->call_id : "-",
+                event->status_code,
+                event->reason_phrase != NULL ? event->reason_phrase : "-");
+        return;
+    }
+
+    fprintf(stdout,
+            "app signal type=%d call_id=%s method=%s from=%s to=%s source=%s:%u\n",
+            event->type,
+            event->call_id != NULL ? event->call_id : "-",
+            event->method != NULL ? event->method : "-",
+            event->from != NULL ? event->from : "-",
+            event->to != NULL ? event->to : "-",
+            event->source_ip != NULL ? event->source_ip : "-",
+            event->source_port);
+}
+
 /* 释放 SDK 上下文持有的线程、媒体缓存与互斥锁。 */
 static void sample_host_destroy(sample_host_t *host)
 {
@@ -785,6 +810,7 @@ int main(int argc, char **argv)
     }
 
     memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.on_signal = sample_host_on_signal;
     callbacks.on_media = sample_host_on_media;
     callbacks.user_data = &host;
     sip_embed_service_set_callbacks(service, &callbacks);
