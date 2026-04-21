@@ -13,7 +13,7 @@
 /* G711A 在 8kHz 下每 20ms 对应 160 个采样。 */
 #define G711A_SAMPLES_PER_PACKET 160U
 
-static volatile sig_atomic_t g_stop = 0;
+static sip_embed_service_t *g_service = NULL;
 
 /* 示例程序自己的配置，公共 SIP/RTP 配置之外的字段不进入库 API。 */
 typedef struct {
@@ -60,7 +60,9 @@ typedef struct {
 static void handle_signal(int signum)
 {
     (void) signum;
-    g_stop = 1;
+    if (g_service != NULL) {
+        sip_embed_service_stop(g_service);
+    }
 }
 
 /* 用纳秒粒度休眠，并在收到退出信号时提前结束。 */
@@ -74,7 +76,8 @@ static void sleep_ns(long long nanoseconds)
 
     ts.tv_sec = (time_t) (nanoseconds / 1000000000LL);
     ts.tv_nsec = (long) (nanoseconds % 1000000000LL);
-    while (nanosleep(&ts, &ts) != 0 && g_stop == 0) {
+    while (nanosleep(&ts, &ts) != 0 &&
+           (g_service == NULL || !sip_embed_service_stop_requested(g_service))) {
     }
 }
 
@@ -452,7 +455,7 @@ static void *sample_demo_audio_thread_main(void *opaque)
     int announced = 0;
     int paused_for_backpressure = 0;
 
-    while (g_stop == 0) {
+    while (!sip_embed_service_stop_requested(host->service)) {
         int stream_active;
 
         sip_embed_service_get_stream_state(host->service, &stream_active, &generation);
@@ -542,7 +545,7 @@ static void *sample_demo_video_thread_main(void *opaque)
         timestamp_step = 3000;
     }
 
-    while (g_stop == 0) {
+    while (!sip_embed_service_stop_requested(host->service)) {
         int stream_active;
 
         sip_embed_service_get_stream_state(host->service, &stream_active, &generation);
@@ -628,7 +631,7 @@ static int sample_demo_media_start(sample_host_t *host)
     if (demo_media->video_frames != NULL && demo_media->video_frame_count > 0) {
         if (pthread_create(&demo_media->video_thread, NULL, sample_demo_video_thread_main, host) != 0) {
             perror("pthread_create(video-push)");
-            g_stop = 1;
+            sip_embed_service_stop(host->service);
             if (demo_media->audio_thread_running) {
                 pthread_join(demo_media->audio_thread, NULL);
                 demo_media->audio_thread_running = 0;
@@ -773,8 +776,10 @@ int main(int argc, char **argv)
     if (service == NULL) {
         return 1;
     }
+    g_service = service;
 
     if (sample_host_init(&host, &config, service) != 0) {
+        g_service = NULL;
         sip_embed_service_destroy(service);
         return 1;
     }
@@ -796,9 +801,10 @@ int main(int argc, char **argv)
             config_rtp_transport_name(config.app.rtp_transport),
             config_audio_codec_name(config.app.audio_codec));
 
-    run_rc = sip_embed_service_run(service, &g_stop);
-    g_stop = 1;
+    run_rc = sip_embed_service_run(service);
+    sip_embed_service_stop(service);
     sample_host_destroy(&host);
+    g_service = NULL;
     sip_embed_service_destroy(service);
     return run_rc;
 }

@@ -11,6 +11,7 @@ struct sip_session_service {
     pthread_mutex_t mutex;
     streamer_t *streamer;
     unsigned int stream_generation;
+    volatile int stop_requested;
     sip_session_callbacks_t callbacks;
 };
 
@@ -260,21 +261,40 @@ void sip_session_service_set_callbacks(sip_session_service_t *service, const sip
     service->callbacks = *callbacks;
 }
 
-int sip_session_service_run(sip_session_service_t *service, volatile sig_atomic_t *stop_flag)
+void sip_session_service_stop(sip_session_service_t *service)
+{
+    if (service == NULL) {
+        return;
+    }
+
+    service->stop_requested = 1;
+}
+
+int sip_session_service_stop_requested(sip_session_service_t *service)
+{
+    if (service == NULL) {
+        return 1;
+    }
+
+    return service->stop_requested != 0;
+}
+
+int sip_session_service_run(sip_session_service_t *service)
 {
     sip_server_handlers_t handlers;
 
-    if (service == NULL || stop_flag == NULL) {
+    if (service == NULL) {
         return -1;
     }
 
+    service->stop_requested = 0;
     memset(&handlers, 0, sizeof(handlers));
     handlers.on_signal = sip_session_on_signal;
     handlers.on_invite = sip_session_on_invite;
     handlers.on_media = sip_session_on_media;
     handlers.user_data = service;
 
-    return sip_server_run_with_handlers(service->config, stop_flag, &handlers);
+    return sip_server_run_with_handlers(service->config, &service->stop_requested, &handlers);
 }
 
 streamer_t *sip_session_service_get_stream(sip_session_service_t *service, unsigned int *generation)

@@ -260,8 +260,8 @@ sip:test@192.168.18.126:6060;transport=tcp
 
 ```c
 sip_embed_service_t *sip_embed_service_create(const app_config_t *config);
-int sip_embed_service_run(sip_embed_service_t *service,
-                          volatile sig_atomic_t *stop_flag);
+void sip_embed_service_stop(sip_embed_service_t *service);
+int sip_embed_service_run(sip_embed_service_t *service);
 int sip_embed_service_push_audio_frame(sip_embed_service_t *service,
                                        const uint8_t *payload,
                                        size_t payload_size,
@@ -278,6 +278,8 @@ int sip_embed_service_push_video_frame(sip_embed_service_t *service,
   创建和释放嵌入式服务实例
 - `sip_embed_service_run()`
   以默认 SIP/媒体处理逻辑运行服务
+- `sip_embed_service_stop()`
+  显式请求嵌入式服务停止退出
 - `sip_embed_service_get_stream_state()`
   读取当前是否存在活动会话以及会话代数，便于宿主在线程里感知切换
 - `sip_embed_service_push_audio_frame()` / `sip_embed_service_push_video_frame()`
@@ -293,7 +295,7 @@ int sip_embed_service_push_video_frame(sip_embed_service_t *service,
 sip_embed_service_t *service = sip_embed_service_create(&config);
 sample_host_init(&host, &config, service);
 
-return sip_embed_service_run(service, &g_stop);
+return sip_embed_service_run(service);
 ```
 
 如果你自己接入上层实时音视频线程，送帧接口就是：

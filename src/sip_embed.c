@@ -114,13 +114,31 @@ void sip_embed_service_set_callbacks(sip_embed_service_t *service, const sip_emb
     sip_session_service_set_callbacks(service->session, callbacks);
 }
 
-int sip_embed_service_run(sip_embed_service_t *service, volatile sig_atomic_t *stop_flag)
+void sip_embed_service_stop(sip_embed_service_t *service)
+{
+    if (service == NULL) {
+        return;
+    }
+
+    sip_session_service_stop(service->session);
+}
+
+int sip_embed_service_stop_requested(sip_embed_service_t *service)
+{
+    if (service == NULL) {
+        return 1;
+    }
+
+    return sip_session_service_stop_requested(service->session);
+}
+
+int sip_embed_service_run(sip_embed_service_t *service)
 {
     if (service == NULL) {
         return -1;
     }
 
-    return sip_session_service_run(service->session, stop_flag);
+    return sip_session_service_run(service->session);
 }
 
 void sip_embed_service_get_stream_state(sip_embed_service_t *service, int *stream_active, unsigned int *generation)

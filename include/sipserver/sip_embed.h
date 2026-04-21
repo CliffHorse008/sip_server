@@ -1,7 +1,6 @@
 #ifndef SIPSERVER_SIP_EMBED_H
 #define SIPSERVER_SIP_EMBED_H
 
-#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -20,8 +19,12 @@ sip_embed_service_t *sip_embed_service_create(const app_config_t *config);
 void sip_embed_service_destroy(sip_embed_service_t *service);
 /* 设置可选的宿主回调。 */
 void sip_embed_service_set_callbacks(sip_embed_service_t *service, const sip_embed_callbacks_t *callbacks);
+/* 请求嵌入式服务停止。 */
+void sip_embed_service_stop(sip_embed_service_t *service);
+/* 查询嵌入式服务是否已收到停止请求。 */
+int sip_embed_service_stop_requested(sip_embed_service_t *service);
 /* 运行 SIP 会话层。 */
-int sip_embed_service_run(sip_embed_service_t *service, volatile sig_atomic_t *stop_flag);
+int sip_embed_service_run(sip_embed_service_t *service);
 /* 读取当前会话状态与代数，便于宿主同步推流状态。 */
 void sip_embed_service_get_stream_state(sip_embed_service_t *service, int *stream_active, unsigned int *generation);
 /* 查询当前音频发送侧是否存在较高的 KCP 待发积压。 */

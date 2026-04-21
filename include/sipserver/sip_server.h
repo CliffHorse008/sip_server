@@ -1,8 +1,6 @@
 #ifndef SIPSERVER_SIP_SERVER_H
 #define SIPSERVER_SIP_SERVER_H
 
-#include <signal.h>
-
 #include "sipserver/streamer.h"
 
 /* 对外暴露的关键信令事件类型。 */
@@ -112,15 +110,15 @@ typedef struct {
 } sip_server_handlers_t;
 
 /* 使用默认行为运行 SIP 服务。 */
-int sip_server_run(const app_config_t *config, volatile sig_atomic_t *stop_flag);
+int sip_server_run(const app_config_t *config, const volatile int *stop_requested);
 /* 使用自定义媒体回调运行 SIP 服务。 */
 int sip_server_run_with_callback(const app_config_t *config,
-                                 volatile sig_atomic_t *stop_flag,
+                                 const volatile int *stop_requested,
                                  streamer_receive_callback_t media_callback,
                                  void *media_user_data);
 /* 使用完整回调集合运行 SIP 服务。 */
 int sip_server_run_with_handlers(const app_config_t *config,
-                                 volatile sig_atomic_t *stop_flag,
+                                 const volatile int *stop_requested,
                                  const sip_server_handlers_t *handlers);
 
 #endif

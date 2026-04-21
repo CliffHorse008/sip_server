@@ -2403,7 +2403,7 @@ static void handle_sip_message(int message_socket,
 }
 
 int sip_server_run_with_handlers(const app_config_t *config,
-                                 volatile sig_atomic_t *stop_flag,
+                                 const volatile int *stop_requested,
                                  const sip_server_handlers_t *handlers)
 {
     int sip_socket;
@@ -2444,7 +2444,7 @@ int sip_server_run_with_handlers(const app_config_t *config,
     memset(invite_transactions, 0, sizeof(invite_transactions));
 
     if (config->sip_transport == SIP_TRANSPORT_UDP) {
-        while (*stop_flag == 0) {
+        while (*stop_requested == 0) {
             char buffer[SIP_BUFFER_SIZE];
             struct sockaddr_in peer;
             socklen_t peer_len = sizeof(peer);
@@ -2500,7 +2500,7 @@ int sip_server_run_with_handlers(const app_config_t *config,
         memset(&client_peer, 0, sizeof(client_peer));
         stream_buffer[0] = '\0';
 
-        while (*stop_flag == 0) {
+        while (*stop_requested == 0) {
             fd_set read_fds;
             struct timeval timeout;
             int ready;
@@ -2658,7 +2658,7 @@ int sip_server_run_with_handlers(const app_config_t *config,
 }
 
 int sip_server_run_with_callback(const app_config_t *config,
-                                 volatile sig_atomic_t *stop_flag,
+                                 const volatile int *stop_requested,
                                  streamer_receive_callback_t media_callback,
                                  void *media_user_data)
 {
@@ -2668,10 +2668,10 @@ int sip_server_run_with_callback(const app_config_t *config,
     handlers.on_media = media_callback;
     handlers.user_data = media_user_data;
 
-    return sip_server_run_with_handlers(config, stop_flag, &handlers);
+    return sip_server_run_with_handlers(config, stop_requested, &handlers);
 }
 
-int sip_server_run(const app_config_t *config, volatile sig_atomic_t *stop_flag)
+int sip_server_run(const app_config_t *config, const volatile int *stop_requested)
 {
-    return sip_server_run_with_handlers(config, stop_flag, NULL);
+    return sip_server_run_with_handlers(config, stop_requested, NULL);
 }
