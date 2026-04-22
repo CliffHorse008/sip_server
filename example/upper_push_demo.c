@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "mock_media_source.h"
 #include "sipserver/config.h"
 #include "sipserver/sip_embed.h"
 
@@ -25,16 +26,15 @@ typedef struct {
 
 /* 一个 H264 Access Unit 在裸码流中的偏移与长度。 */
 typedef struct {
-    size_t offset;
+    unsigned char *data;
     size_t size;
 } h264_access_unit_t;
 
 /* 示例推流线程需要的测试媒体缓存。 */
 typedef struct {
-    unsigned char *video_blob;
-    size_t video_blob_size;
     h264_access_unit_t *video_frames;
     size_t video_frame_count;
+    size_t video_nalu_count;
     unsigned char *audio_blob;
     size_t audio_blob_size;
     pthread_t audio_thread;
@@ -271,35 +271,72 @@ static int find_start_code(const unsigned char *data,
     return 0;
 }
 
-/* 追加一个 Access Unit 的区间记录。 */
-static int demo_append_h264_access_unit(sample_demo_media_t *demo_media, size_t offset, size_t size)
+/* 追加一个 Access Unit 的缓存副本。 */
+static int demo_append_h264_access_unit(sample_demo_media_t *demo_media,
+                                        const uint8_t *access_unit,
+                                        size_t access_unit_size)
 {
     h264_access_unit_t *grown;
     size_t new_count;
+    unsigned char *copy;
 
-    if (size == 0) {
+    if (access_unit == NULL || access_unit_size == 0) {
         return 0;
     }
+
+    copy = (unsigned char *) malloc(access_unit_size);
+    if (copy == NULL) {
+        return -1;
+    }
+    memcpy(copy, access_unit, access_unit_size);
 
     new_count = demo_media->video_frame_count + 1;
     grown = (h264_access_unit_t *) realloc(demo_media->video_frames, new_count * sizeof(*grown));
     if (grown == NULL) {
+        free(copy);
         return -1;
     }
 
     demo_media->video_frames = grown;
-    demo_media->video_frames[demo_media->video_frame_count].offset = offset;
-    demo_media->video_frames[demo_media->video_frame_count].size = size;
+    demo_media->video_frames[demo_media->video_frame_count].data = copy;
+    demo_media->video_frames[demo_media->video_frame_count].size = access_unit_size;
     demo_media->video_frame_count = new_count;
     return 0;
 }
 
-/* 通过 AUD 或起始 NAL 边界，把裸 H264 拆成逐帧发送的 Access Unit。 */
-static int demo_build_h264_access_units(sample_demo_media_t *demo_media)
+static void demo_free_h264_access_units(sample_demo_media_t *demo_media)
 {
-    size_t current_offset = 0;
+    size_t index;
+
+    if (demo_media == NULL) {
+        return;
+    }
+
+    for (index = 0; index < demo_media->video_frame_count; ++index) {
+        free(demo_media->video_frames[index].data);
+        demo_media->video_frames[index].data = NULL;
+        demo_media->video_frames[index].size = 0;
+    }
+    free(demo_media->video_frames);
+    demo_media->video_frames = NULL;
+    demo_media->video_frame_count = 0;
+    demo_media->video_nalu_count = 0;
+}
+
+/* 使用对外暴露的 demo API，把 Annex-B 裸流逐个 NALU 喂入并组装成 AU。 */
+static int demo_build_h264_access_units(sample_demo_media_t *demo_media,
+                                        const unsigned char *video_blob,
+                                        size_t video_blob_size)
+{
     size_t search_offset = 0;
-    int have_current = 0;
+    mock_h264_au_builder_t builder;
+    const uint8_t *access_unit = NULL;
+    size_t access_unit_size = 0;
+    int flush_rc;
+
+    memset(&builder, 0, sizeof(builder));
+    mock_h264_au_builder_init(&builder);
+    demo_media->video_nalu_count = 0;
 
     while (1) {
         size_t start_offset;
@@ -307,10 +344,11 @@ static int demo_build_h264_access_units(sample_demo_media_t *demo_media)
         size_t next_offset;
         size_t next_code_size;
         size_t nal_offset;
-        unsigned char nal_type;
+        size_t nal_end;
+        int has_next;
 
-        if (!find_start_code(demo_media->video_blob,
-                             demo_media->video_blob_size,
+        if (!find_start_code(video_blob,
+                             video_blob_size,
                              search_offset,
                              &start_offset,
                              &code_size)) {
@@ -318,44 +356,57 @@ static int demo_build_h264_access_units(sample_demo_media_t *demo_media)
         }
 
         nal_offset = start_offset + code_size;
-        if (nal_offset >= demo_media->video_blob_size) {
+        if (nal_offset >= video_blob_size) {
             break;
         }
 
-        nal_type = (unsigned char) (demo_media->video_blob[nal_offset] & 0x1F);
+        has_next = find_start_code(video_blob,
+                                   video_blob_size,
+                                   nal_offset,
+                                   &next_offset,
+                                   &next_code_size);
+        nal_end = has_next ? next_offset : video_blob_size;
+        while (nal_end > nal_offset && video_blob[nal_end - 1] == 0x00U) {
+            --nal_end;
+        }
 
-        if (nal_type == 9) {
-            if (have_current && start_offset > current_offset) {
-                if (demo_append_h264_access_unit(demo_media, current_offset, start_offset - current_offset) != 0) {
-                    return -1;
-                }
+        if (nal_end > start_offset) {
+            int input_rc = mock_h264_input_nalu(&builder,
+                                                video_blob + start_offset,
+                                                nal_end - start_offset,
+                                                &access_unit,
+                                                &access_unit_size);
+
+            if (input_rc < 0) {
+                mock_h264_au_builder_cleanup(&builder);
+                return -1;
             }
-            current_offset = start_offset;
-            have_current = 1;
-        } else if (!have_current) {
-            current_offset = start_offset;
-            have_current = 1;
+            ++demo_media->video_nalu_count;
+            if (input_rc > 0 &&
+                demo_append_h264_access_unit(demo_media, access_unit, access_unit_size) != 0) {
+                mock_h264_au_builder_cleanup(&builder);
+                return -1;
+            }
         }
 
-        if (!find_start_code(demo_media->video_blob,
-                             demo_media->video_blob_size,
-                             nal_offset,
-                             &next_offset,
-                             &next_code_size)) {
-            (void) next_code_size;
+        if (!has_next) {
             break;
         }
-
         search_offset = next_offset;
     }
 
-    if (have_current && current_offset < demo_media->video_blob_size) {
-        if (demo_append_h264_access_unit(demo_media,
-                                         current_offset,
-                                         demo_media->video_blob_size - current_offset) != 0) {
-            return -1;
-        }
+    flush_rc = mock_h264_flush(&builder, &access_unit, &access_unit_size);
+    if (flush_rc < 0) {
+        mock_h264_au_builder_cleanup(&builder);
+        return -1;
     }
+    if (flush_rc > 0 &&
+        demo_append_h264_access_unit(demo_media, access_unit, access_unit_size) != 0) {
+        mock_h264_au_builder_cleanup(&builder);
+        return -1;
+    }
+
+    mock_h264_au_builder_cleanup(&builder);
 
     return demo_media->video_frame_count > 0 ? 0 : -1;
 }
@@ -416,17 +467,15 @@ static int sample_host_push_video_frame(sample_host_t *host,
 static int sample_demo_media_load(sample_host_t *host)
 {
     sample_demo_media_t *demo_media = &host->demo_media;
+    unsigned char *video_blob = NULL;
+    size_t video_blob_size = 0;
 
-    if (read_entire_file(host->config->video_path, &demo_media->video_blob, &demo_media->video_blob_size) == 0) {
-        if (demo_build_h264_access_units(demo_media) != 0) {
+    if (read_entire_file(host->config->video_path, &video_blob, &video_blob_size) == 0) {
+        if (demo_build_h264_access_units(demo_media, video_blob, video_blob_size) != 0) {
             fprintf(stderr, "failed to parse H264 access units from %s\n", host->config->video_path);
-            free(demo_media->video_blob);
-            demo_media->video_blob = NULL;
-            demo_media->video_blob_size = 0;
-            free(demo_media->video_frames);
-            demo_media->video_frames = NULL;
-            demo_media->video_frame_count = 0;
+            demo_free_h264_access_units(demo_media);
         }
+        free(video_blob);
     } else {
         fprintf(stderr, "failed to load video file: %s\n", host->config->video_path);
     }
@@ -438,7 +487,8 @@ static int sample_demo_media_load(sample_host_t *host)
     }
 
     fprintf(stdout,
-            "demo media loaded video_frames=%zu audio_bytes=%zu\n",
+            "demo media loaded video_nalus=%zu video_frames=%zu audio_bytes=%zu\n",
+            demo_media->video_nalu_count,
             demo_media->video_frame_count,
             demo_media->audio_blob_size);
     return 0;
@@ -567,9 +617,8 @@ static void *sample_demo_video_thread_main(void *opaque)
 
         {
             const h264_access_unit_t *access_unit = &demo_media->video_frames[frame_index];
-            const unsigned char *access_unit_data = demo_media->video_blob + access_unit->offset;
             int backlog_high = sip_embed_service_video_backpressure_high(host->service);
-            int is_idr = demo_h264_access_unit_has_idr(access_unit_data, access_unit->size);
+            int is_idr = demo_h264_access_unit_has_idr(access_unit->data, access_unit->size);
 
             if (backlog_high && !waiting_for_idr) {
                 fprintf(stdout, "demo video push paused due to KCP backlog, wait for next IDR\n");
@@ -588,7 +637,7 @@ static void *sample_demo_video_thread_main(void *opaque)
                 waiting_for_idr = 0;
             }
 
-            if (sample_host_push_video_frame(host, access_unit_data, access_unit->size, timestamp) == 0) {
+            if (sample_host_push_video_frame(host, access_unit->data, access_unit->size, timestamp) == 0) {
                 ++frame_index;
                 timestamp += timestamp_step;
             }
@@ -745,8 +794,7 @@ static void sample_host_destroy(sample_host_t *host)
 
     sample_demo_media_stop(host);
     pthread_mutex_destroy(&host->media_log_mutex);
-    free(demo_media->video_frames);
-    free(demo_media->video_blob);
+    demo_free_h264_access_units(demo_media);
     free(demo_media->audio_blob);
 }
 

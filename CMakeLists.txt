@@ -19,6 +19,7 @@ add_library(sipserver STATIC
 )
 
 add_executable(sipserver_upper_push_demo
+    example/mock_media_source.c
     example/upper_push_demo.c
 )
 
