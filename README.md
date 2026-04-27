@@ -203,7 +203,7 @@ sip:test@192.168.18.126:6060;transport=tcp
 
 - `--sip-port`：SIP 监听端口，默认 `5060`
 - `--sip-transport`：SIP 信令传输方式，支持 `udp` / `tcp`，默认 `udp`
-- `--rtp-transport`：RTP 媒体传输方式，支持 `udp` / `kcp`，默认 `udp`
+- `--rtp-transport`：RTP 媒体默认传输方式，支持 `udp` / `kcp`，默认 `udp`；实际会按客户端 Offer 的每路媒体 transport 协商
 - `--sip-session-expires`：SIP Session Timer 秒数，默认 `90`
 - `--audio-port`：本地音频 RTP 端口，默认 `5004`
 - `--video-port`：本地视频 RTP 端口，默认 `5006`
@@ -221,8 +221,8 @@ sip:test@192.168.18.126:6060;transport=tcp
 
 当前实现对 SDP 的处理规则：
 
-- `--rtp-transport udp` 时支持 `RTP/AVP` 和 `RTP/AVPF`
-- `--rtp-transport kcp` 时支持 `KCP/RTP/AVP` 和 `KCP/RTP/AVPF`
+- 同一服务端同时支持 `RTP/AVP`、`RTP/AVPF`、`KCP/RTP/AVP` 和 `KCP/RTP/AVPF`
+- Answer 会沿用客户端 Offer 中被接受媒体行的 transport；未提供或无法识别时才使用 `--rtp-transport` 对应的默认值
 - 音频当前仅协商 `PCMA`
 - 视频当前协商 `H264`
 - 未接受的媒体行会在 Answer 中返回 `port 0`

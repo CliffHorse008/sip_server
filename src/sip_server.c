@@ -651,18 +651,21 @@ static int is_sdp_direction_attribute(const char *value)
            str_case_equal(value, "inactive");
 }
 
-static int sdp_transport_supported(const char *transport, const app_config_t *config)
+static int sdp_transport_supported(const char *transport)
 {
-    if (config->rtp_transport == RTP_TRANSPORT_KCP) {
-        return str_case_equal(transport, "KCP/RTP/AVP") || str_case_equal(transport, "KCP/RTP/AVPF");
+    if (transport == NULL || transport[0] == '\0') {
+        return 0;
     }
 
-    return str_case_equal(transport, "RTP/AVP") || str_case_equal(transport, "RTP/AVPF");
+    return str_case_equal(transport, "RTP/AVP") ||
+           str_case_equal(transport, "RTP/AVPF") ||
+           str_case_equal(transport, "KCP/RTP/AVP") ||
+           str_case_equal(transport, "KCP/RTP/AVPF");
 }
 
 static const char *select_sdp_transport(const char *transport, const app_config_t *config)
 {
-    if (transport != NULL && transport[0] != '\0' && sdp_transport_supported(transport, config)) {
+    if (sdp_transport_supported(transport)) {
         return transport;
     }
 
@@ -941,13 +944,12 @@ static int build_sdp_plan(const sdp_offer_t *offer,
                  "%s",
                  select_sdp_transport(offered->transport, config));
 
-        if (!sdp_transport_supported(offered->transport, config) || offered->port == 0) {
-            if (offered->port != 0 && offered->transport[0] != '\0' && !sdp_transport_supported(offered->transport, config)) {
+        if (!sdp_transport_supported(offered->transport) || offered->port == 0) {
+            if (offered->port != 0 && offered->transport[0] != '\0' && !sdp_transport_supported(offered->transport)) {
                 fprintf(stdout,
-                        "reject %s media due to transport mismatch offer=%s required=%s\n",
+                        "reject %s media due to unsupported transport offer=%s supported=RTP/AVP,RTP/AVPF,KCP/RTP/AVP,KCP/RTP/AVPF\n",
                         offered->kind == STREAMER_MEDIA_AUDIO ? "audio" : "video",
-                        offered->transport,
-                        default_sdp_transport(config));
+                        offered->transport);
             }
             continue;
         }
@@ -1744,7 +1746,7 @@ static void summarize_offer_for_upper_layer(const sdp_offer_t *offer,
             }
         }
 
-        if (!sdp_transport_supported(media->transport, config) || media->port == 0) {
+        if (!sdp_transport_supported(media->transport) || media->port == 0) {
             continue;
         }
 
@@ -1754,6 +1756,7 @@ static void summarize_offer_for_upper_layer(const sdp_offer_t *offer,
             if (summary->audio_port == 0 && choose_audio_payload(media, config, &payload_type)) {
                 summary->audio_port = media->port;
                 summary->audio_payload_type = payload_type;
+                snprintf(summary->audio_transport, sizeof(summary->audio_transport), "%s", media->transport);
             }
         } else {
             uint8_t payload_type = 0;
@@ -1761,6 +1764,7 @@ static void summarize_offer_for_upper_layer(const sdp_offer_t *offer,
             if (summary->video_port == 0 && choose_video_payload(media, &payload_type)) {
                 summary->video_port = media->port;
                 summary->video_payload_type = payload_type;
+                snprintf(summary->video_transport, sizeof(summary->video_transport), "%s", media->transport);
             }
         }
     }
