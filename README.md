@@ -55,7 +55,7 @@
 
 当前实现是“最小框架”，重点在工程骨架、上层送帧链路和 RTP 回调接入点：
 
-- 支持 SIP 基础方法：`OPTIONS`、`REGISTER`、`INVITE`、`ACK`、`BYE`
+- 支持 SIP 基础方法：`OPTIONS`、`REGISTER`、`INVITE`、`ACK`、`BYE`、`UPDATE`
 - SIP 信令可运行在 UDP 或 TCP；RTP 媒体可选 `udp` 或 `kcp`
 - 收到 `INVITE` 后解析对端 SDP 中的 `m=`、`rtpmap`、`fmtp`、方向属性和 RTP 端口
 - 会按 Offer 生成最小可用的 SDP Answer，并沿用对端的 payload type
@@ -204,7 +204,7 @@ sip:test@192.168.18.126:6060;transport=tcp
 - `--sip-port`：SIP 监听端口，默认 `5060`
 - `--sip-transport`：SIP 信令传输方式，支持 `udp` / `tcp`，默认 `udp`
 - `--rtp-transport`：RTP 媒体默认传输方式，支持 `udp` / `kcp`，默认 `udp`；实际会按客户端 Offer 的每路媒体 transport 协商
-- `--sip-session-expires`：SIP Session Timer 秒数，默认 `90`
+- `--sip-session-expires`：SIP Session Timer 秒数，默认 `90`；支持通过 re-INVITE 或不带 SDP body 的 UPDATE 刷新会话
 - `--audio-port`：本地音频 RTP 端口，默认 `5004`
 - `--video-port`：本地视频 RTP 端口，默认 `5006`
 - `--video-fps`：示例程序的视频发送节奏，默认 `30`

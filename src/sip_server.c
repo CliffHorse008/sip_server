@@ -23,6 +23,7 @@
 #define SIP_MAX_INVITE_TRANSACTIONS 8
 #define SIP_MAX_TERMINATED_DIALOGS 8
 #define SIP_EXTRA_HEADERS_SIZE 1024
+#define SIP_ALLOW_METHODS "INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER, UPDATE"
 
 typedef struct {
     char method[16];
@@ -314,6 +315,11 @@ static int parse_content_length(const char *message, size_t *content_length)
     return 0;
 }
 
+static int request_has_body(const sip_request_t *request)
+{
+    return request->body != NULL && request->body[0] != '\0';
+}
+
 static int sip_stream_try_extract_message_length(const char *buffer, size_t buffered, size_t *message_length)
 {
     const char *header_end = strstr(buffer, "\r\n\r\n");
@@ -462,7 +468,7 @@ static int build_session_timer_headers(char *buffer,
     if (include_allow) {
         current = snprintf(buffer + written,
                            buffer_size - (size_t) written,
-                           "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n");
+                           "Allow: " SIP_ALLOW_METHODS "\r\n");
         if (current < 0 || (size_t) current >= buffer_size - (size_t) written) {
             return -1;
         }
@@ -2011,7 +2017,7 @@ static void handle_sip_message(int message_socket,
                                "OK",
                                local_tag,
                                config,
-                               "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, REGISTER\r\n",
+                               "Allow: " SIP_ALLOW_METHODS "\r\n",
                                NULL,
                                handlers,
                                streamer);
@@ -2325,6 +2331,125 @@ static void handle_sip_message(int message_socket,
                                   NULL);
             }
         }
+    } else if (str_case_equal(request.method, "UPDATE")) {
+        unsigned int session_expires = 0;
+        int session_interval_too_small = 0;
+        char session_headers[SIP_EXTRA_HEADERS_SIZE];
+
+        if (!dialog_matches(dialog, &request)) {
+            char local_tag[32];
+
+            generate_local_tag(local_tag, sizeof(local_tag));
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   481,
+                                   "Call/Transaction Does Not Exist",
+                                   local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            return;
+        }
+
+        if (request_has_body(&request)) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   415,
+                                   "Unsupported Media Type",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            return;
+        }
+
+        if (negotiate_session_expires(config, buffer, &session_expires, &session_interval_too_small) != 0) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   400,
+                                   "Bad Request",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            return;
+        }
+
+        if (session_interval_too_small) {
+            if (build_session_timer_headers(session_headers, sizeof(session_headers), config, 0, 0, 1) != 0) {
+                send_response_and_emit(message_socket,
+                                       peer,
+                                       &request,
+                                       500,
+                                       "Server Error",
+                                       dialog->local_tag,
+                                       config,
+                                       NULL,
+                                       NULL,
+                                       handlers,
+                                       streamer);
+                return;
+            }
+
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   422,
+                                   "Session Interval Too Small",
+                                   dialog->local_tag,
+                                   config,
+                                   session_headers,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            return;
+        }
+
+        if (build_session_timer_headers(session_headers,
+                                        sizeof(session_headers),
+                                        config,
+                                        session_expires,
+                                        1,
+                                        1) != 0) {
+            send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   500,
+                                   "Server Error",
+                                   dialog->local_tag,
+                                   config,
+                                   NULL,
+                                   NULL,
+                                   handlers,
+                                   streamer);
+            return;
+        }
+
+        if (send_response_and_emit(message_socket,
+                                   peer,
+                                   &request,
+                                   200,
+                                   "OK",
+                                   dialog->local_tag,
+                                   config,
+                                   session_headers,
+                                   NULL,
+                                   handlers,
+                                   streamer) != 0) {
+            return;
+        }
+
+        dialog_update_from_request(dialog, &request);
+        dialog_refresh_session_timer(dialog, session_expires);
     } else if (str_case_equal(request.method, "BYE")) {
         if (dialog_matches_for_termination(dialog, &request)) {
             if (!dialog_matches(dialog, &request)) {
