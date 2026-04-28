@@ -29,8 +29,8 @@ target_include_directories(sipserver
 )
 target_include_directories(sipserver_upper_push_demo PRIVATE include)
 
-target_compile_options(sipserver PRIVATE -Wall -Wextra -Wpedantic)
-target_compile_options(sipserver_upper_push_demo PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(sipserver PRIVATE -Wall -Wextra -Wpedantic -O2)
+target_compile_options(sipserver_upper_push_demo PRIVATE -Wall -Wextra -Wpedantic -O2)
 
 target_compile_definitions(sipserver PRIVATE _POSIX_C_SOURCE=200809L)
 target_compile_definitions(sipserver_upper_push_demo PRIVATE _POSIX_C_SOURCE=200809L)
