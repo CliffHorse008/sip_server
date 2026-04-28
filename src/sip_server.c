@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 
 #include "internal/net.h"
@@ -753,10 +754,18 @@ static int parse_sdp_media_line(const char *line, size_t line_len, sdp_offer_t *
     snprintf(media->transport, sizeof(media->transport), "%s", token);
 
     while ((token = strtok_r(NULL, " ", &saveptr)) != NULL) {
+        unsigned long payload;
+
         if (media->payload_count >= SDP_MAX_PAYLOADS) {
             break;
         }
-        media->payloads[media->payload_count++] = strtoul(token, NULL, 10);
+
+        payload = strtoul(token, NULL, 10);
+        if (payload > UINT_MAX) {
+            continue;
+        }
+
+        media->payloads[media->payload_count++] = (unsigned int) payload;
     }
 
     ++offer->media_count;

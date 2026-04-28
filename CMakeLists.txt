@@ -8,6 +8,28 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 
+function(target_enable_strict_warnings target)
+    target_compile_options(${target} PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Werror
+        -Wformat=2
+        -Wshadow
+        -Wconversion
+        -Wsign-conversion
+        -Wcast-align
+        -Wcast-qual
+        -Wstrict-prototypes
+        -Wmissing-prototypes
+        -Wold-style-definition
+        -Wundef
+        -Wwrite-strings
+        -Wvla
+        -Wswitch-enum
+    )
+endfunction()
+
 add_library(sipserver STATIC
     src/config.c
     src/ikcp.c
@@ -29,8 +51,12 @@ target_include_directories(sipserver
 )
 target_include_directories(sipserver_upper_push_demo PRIVATE include)
 
-target_compile_options(sipserver PRIVATE -Wall -Wextra -Wpedantic -O2)
-target_compile_options(sipserver_upper_push_demo PRIVATE -Wall -Wextra -Wpedantic -O2)
+target_enable_strict_warnings(sipserver)
+target_enable_strict_warnings(sipserver_upper_push_demo)
+
+set_source_files_properties(src/ikcp.c PROPERTIES
+    COMPILE_OPTIONS "-w"
+)
 
 target_compile_definitions(sipserver PRIVATE _POSIX_C_SOURCE=200809L)
 target_compile_definitions(sipserver_upper_push_demo PRIVATE _POSIX_C_SOURCE=200809L)
