@@ -7,7 +7,6 @@
 #include <sys/time.h>
 #include <time.h>
 
-#include "mock_media_source.h"
 #include "sipserver/config.h"
 #include "sipserver/sip_embed.h"
 
@@ -30,6 +29,27 @@ typedef struct {
     size_t size;
 } h264_access_unit_t;
 
+typedef int (*h264_access_unit_output_fn)(const uint8_t *access_unit,
+                                          size_t access_unit_size,
+                                          void *user_data);
+
+/*
+ * 可移植的 H264 Annex-B 分片转 Access Unit 状态。
+ * 板端使用时按实时收到的 H264 码流片段反复调用 demo_h264_input_stream_fragment()，
+ * 回调输出的 access_unit 可直接传给 sip_embed_service_push_video_frame()。
+ */
+typedef struct {
+    unsigned char *pending_stream;
+    size_t pending_stream_size;
+    size_t pending_stream_capacity;
+    unsigned char *current_au;
+    size_t current_au_size;
+    size_t current_au_capacity;
+    int have_current_au;
+    int current_au_has_vcl;
+    size_t nalu_count;
+} h264_access_unit_stream_t;
+
 /* 示例推流线程需要的测试媒体缓存。 */
 typedef struct {
     h264_access_unit_t *video_frames;
@@ -42,6 +62,11 @@ typedef struct {
     int audio_thread_running;
     int video_thread_running;
 } sample_demo_media_t;
+
+typedef struct {
+    sample_demo_media_t *demo_media;
+    int failed;
+} h264_access_unit_collect_ctx_t;
 
 /* 示例宿主上下文，包含嵌入式服务实例与演示媒体状态。 */
 typedef struct {
@@ -271,6 +296,425 @@ static int find_start_code(const unsigned char *data,
     return 0;
 }
 
+typedef struct {
+    const unsigned char *data;
+    size_t size;
+    size_t bit_offset;
+} h264_bit_reader_t;
+
+static int h264_read_bit(h264_bit_reader_t *reader, unsigned int *bit)
+{
+    size_t byte_offset;
+    unsigned int shift;
+
+    if (reader == NULL || bit == NULL || reader->bit_offset >= reader->size * 8U) {
+        return -1;
+    }
+
+    byte_offset = reader->bit_offset / 8U;
+    shift = (unsigned int) (7U - (reader->bit_offset % 8U));
+    *bit = (unsigned int) ((reader->data[byte_offset] >> shift) & 0x01U);
+    ++reader->bit_offset;
+    return 0;
+}
+
+static int h264_read_ue(h264_bit_reader_t *reader, unsigned int *value)
+{
+    unsigned int leading_zero_bits = 0U;
+    unsigned int suffix = 0U;
+    unsigned int bit;
+    unsigned int index;
+
+    if (reader == NULL || value == NULL) {
+        return -1;
+    }
+
+    while (1) {
+        if (h264_read_bit(reader, &bit) != 0) {
+            return -1;
+        }
+        if (bit != 0U) {
+            break;
+        }
+        ++leading_zero_bits;
+        if (leading_zero_bits > 31U) {
+            return -1;
+        }
+    }
+
+    for (index = 0U; index < leading_zero_bits; ++index) {
+        if (h264_read_bit(reader, &bit) != 0) {
+            return -1;
+        }
+        suffix = (suffix << 1U) | bit;
+    }
+
+    *value = ((1U << leading_zero_bits) - 1U) + suffix;
+    return 0;
+}
+
+static size_t h264_ebsp_to_rbsp(const unsigned char *ebsp,
+                                size_t ebsp_size,
+                                unsigned char *rbsp,
+                                size_t rbsp_capacity)
+{
+    size_t src_index;
+    size_t dst_index = 0U;
+    unsigned int zero_count = 0U;
+
+    for (src_index = 0U; src_index < ebsp_size; ++src_index) {
+        unsigned char byte = ebsp[src_index];
+
+        if (zero_count >= 2U && byte == 0x03U) {
+            zero_count = 0U;
+            continue;
+        }
+
+        if (dst_index >= rbsp_capacity) {
+            return 0U;
+        }
+        rbsp[dst_index++] = byte;
+
+        if (byte == 0x00U) {
+            ++zero_count;
+        } else {
+            zero_count = 0U;
+        }
+    }
+
+    return dst_index;
+}
+
+static int h264_nalu_is_vcl(unsigned char nal_type)
+{
+    return nal_type >= 1U && nal_type <= 5U;
+}
+
+static int h264_nalu_first_mb_is_zero(const unsigned char *nalu, size_t nalu_size, int *is_zero)
+{
+    unsigned char *rbsp;
+    size_t rbsp_size;
+    h264_bit_reader_t reader;
+    unsigned int first_mb_in_slice;
+
+    if (nalu == NULL || nalu_size <= 1U || is_zero == NULL) {
+        return -1;
+    }
+
+    rbsp = (unsigned char *) malloc(nalu_size - 1U);
+    if (rbsp == NULL) {
+        return -1;
+    }
+
+    rbsp_size = h264_ebsp_to_rbsp(nalu + 1U, nalu_size - 1U, rbsp, nalu_size - 1U);
+    if (rbsp_size == 0U) {
+        free(rbsp);
+        return -1;
+    }
+
+    reader.data = rbsp;
+    reader.size = rbsp_size;
+    reader.bit_offset = 0U;
+    if (h264_read_ue(&reader, &first_mb_in_slice) != 0) {
+        free(rbsp);
+        return -1;
+    }
+
+    free(rbsp);
+    *is_zero = first_mb_in_slice == 0U;
+    return 0;
+}
+
+static void h264_access_unit_stream_init(h264_access_unit_stream_t *stream)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    memset(stream, 0, sizeof(*stream));
+}
+
+static void h264_access_unit_stream_cleanup(h264_access_unit_stream_t *stream)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    free(stream->pending_stream);
+    free(stream->current_au);
+    memset(stream, 0, sizeof(*stream));
+}
+
+static int h264_reserve_buffer(unsigned char **buffer,
+                               size_t *capacity,
+                               size_t current_size,
+                               size_t additional_size)
+{
+    unsigned char *grown;
+    size_t required_size;
+    size_t new_capacity;
+
+    if (buffer == NULL || capacity == NULL) {
+        return -1;
+    }
+    if (additional_size > ((size_t) -1) - current_size) {
+        return -1;
+    }
+
+    required_size = current_size + additional_size;
+    if (required_size <= *capacity) {
+        return 0;
+    }
+
+    new_capacity = *capacity > 0U ? *capacity : 256U;
+    while (new_capacity < required_size) {
+        if (new_capacity > ((size_t) -1) / 2U) {
+            new_capacity = required_size;
+            break;
+        }
+        new_capacity *= 2U;
+    }
+
+    grown = (unsigned char *) realloc(*buffer, new_capacity);
+    if (grown == NULL) {
+        return -1;
+    }
+
+    *buffer = grown;
+    *capacity = new_capacity;
+    return 0;
+}
+
+static int h264_access_unit_stream_append_pending(h264_access_unit_stream_t *stream,
+                                                  const uint8_t *fragment,
+                                                  size_t fragment_size)
+{
+    if (stream == NULL) {
+        return -1;
+    }
+    if (fragment_size == 0U) {
+        return 0;
+    }
+    if (fragment == NULL) {
+        return -1;
+    }
+
+    if (h264_reserve_buffer(&stream->pending_stream,
+                            &stream->pending_stream_capacity,
+                            stream->pending_stream_size,
+                            fragment_size) != 0) {
+        return -1;
+    }
+
+    memcpy(stream->pending_stream + stream->pending_stream_size, fragment, fragment_size);
+    stream->pending_stream_size += fragment_size;
+    return 0;
+}
+
+static void h264_access_unit_stream_discard_pending_prefix(h264_access_unit_stream_t *stream,
+                                                           size_t keep_offset)
+{
+    if (stream == NULL || keep_offset == 0U) {
+        return;
+    }
+
+    if (keep_offset >= stream->pending_stream_size) {
+        stream->pending_stream_size = 0U;
+        return;
+    }
+
+    memmove(stream->pending_stream,
+            stream->pending_stream + keep_offset,
+            stream->pending_stream_size - keep_offset);
+    stream->pending_stream_size -= keep_offset;
+}
+
+static int h264_access_unit_stream_emit_current(h264_access_unit_stream_t *stream,
+                                                h264_access_unit_output_fn output,
+                                                void *user_data)
+{
+    int rc;
+
+    if (stream == NULL) {
+        return -1;
+    }
+    if (!stream->have_current_au || stream->current_au_size == 0U) {
+        stream->have_current_au = 0;
+        stream->current_au_has_vcl = 0;
+        stream->current_au_size = 0U;
+        return 0;
+    }
+    if (output == NULL) {
+        return -1;
+    }
+
+    rc = output(stream->current_au, stream->current_au_size, user_data);
+    stream->have_current_au = 0;
+    stream->current_au_has_vcl = 0;
+    stream->current_au_size = 0U;
+    return rc;
+}
+
+static int h264_access_unit_stream_append_nalu(h264_access_unit_stream_t *stream,
+                                               const unsigned char *nalu,
+                                               size_t nalu_size)
+{
+    static const unsigned char start_code[4] = {0x00U, 0x00U, 0x00U, 0x01U};
+
+    if (stream == NULL || nalu == NULL || nalu_size == 0U) {
+        return -1;
+    }
+
+    if (h264_reserve_buffer(&stream->current_au,
+                            &stream->current_au_capacity,
+                            stream->current_au_size,
+                            sizeof(start_code) + nalu_size) != 0) {
+        return -1;
+    }
+
+    memcpy(stream->current_au + stream->current_au_size, start_code, sizeof(start_code));
+    stream->current_au_size += sizeof(start_code);
+    memcpy(stream->current_au + stream->current_au_size, nalu, nalu_size);
+    stream->current_au_size += nalu_size;
+    stream->have_current_au = 1;
+    return 0;
+}
+
+static int h264_access_unit_stream_input_nalu(h264_access_unit_stream_t *stream,
+                                              const unsigned char *nalu,
+                                              size_t nalu_size,
+                                              h264_access_unit_output_fn output,
+                                              void *user_data)
+{
+    unsigned char nal_type;
+    int starts_new_au = 0;
+
+    if (stream == NULL || nalu == NULL || nalu_size == 0U) {
+        return -1;
+    }
+
+    nal_type = (unsigned char) (nalu[0] & 0x1FU);
+    if (stream->have_current_au && stream->current_au_has_vcl) {
+        if (nal_type == 9U || nal_type == 6U || nal_type == 7U || nal_type == 8U ||
+            (nal_type >= 10U && nal_type <= 18U)) {
+            starts_new_au = 1;
+        } else if (h264_nalu_is_vcl(nal_type)) {
+            int first_mb_is_zero = 0;
+
+            if (h264_nalu_first_mb_is_zero(nalu, nalu_size, &first_mb_is_zero) == 0 &&
+                first_mb_is_zero) {
+                starts_new_au = 1;
+            }
+        }
+    }
+
+    if (starts_new_au && h264_access_unit_stream_emit_current(stream, output, user_data) != 0) {
+        return -1;
+    }
+
+    if (h264_access_unit_stream_append_nalu(stream, nalu, nalu_size) != 0) {
+        return -1;
+    }
+
+    if (h264_nalu_is_vcl(nal_type)) {
+        stream->current_au_has_vcl = 1;
+    }
+    ++stream->nalu_count;
+    return 0;
+}
+
+static int h264_access_unit_stream_process_pending(h264_access_unit_stream_t *stream,
+                                                   int flush,
+                                                   h264_access_unit_output_fn output,
+                                                   void *user_data)
+{
+    while (stream->pending_stream_size > 0U) {
+        size_t start_offset;
+        size_t code_size;
+        size_t nal_offset;
+        size_t next_offset;
+        size_t next_code_size;
+        size_t nal_end;
+        int has_next;
+
+        if (!find_start_code(stream->pending_stream,
+                             stream->pending_stream_size,
+                             0U,
+                             &start_offset,
+                             &code_size)) {
+            if (stream->pending_stream_size > 3U) {
+                h264_access_unit_stream_discard_pending_prefix(stream,
+                                                               stream->pending_stream_size - 3U);
+            }
+            return 0;
+        }
+
+        if (start_offset > 0U) {
+            h264_access_unit_stream_discard_pending_prefix(stream, start_offset);
+            continue;
+        }
+
+        nal_offset = code_size;
+        if (nal_offset >= stream->pending_stream_size) {
+            return 0;
+        }
+
+        has_next = find_start_code(stream->pending_stream,
+                                   stream->pending_stream_size,
+                                   nal_offset,
+                                   &next_offset,
+                                   &next_code_size);
+        (void) next_code_size;
+        if (!has_next && !flush) {
+            return 0;
+        }
+
+        nal_end = has_next ? next_offset : stream->pending_stream_size;
+        while (nal_end > nal_offset && stream->pending_stream[nal_end - 1U] == 0x00U) {
+            --nal_end;
+        }
+
+        if (nal_end > nal_offset &&
+            h264_access_unit_stream_input_nalu(stream,
+                                               stream->pending_stream + nal_offset,
+                                               nal_end - nal_offset,
+                                               output,
+                                               user_data) != 0) {
+            return -1;
+        }
+
+        if (has_next) {
+            h264_access_unit_stream_discard_pending_prefix(stream, next_offset);
+        } else {
+            stream->pending_stream_size = 0U;
+        }
+    }
+
+    if (flush && h264_access_unit_stream_emit_current(stream, output, user_data) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int demo_h264_input_stream_fragment(h264_access_unit_stream_t *stream,
+                                           const uint8_t *fragment,
+                                           size_t fragment_size,
+                                           int flush,
+                                           h264_access_unit_output_fn output,
+                                           void *user_data)
+{
+    if (stream == NULL || output == NULL) {
+        return -1;
+    }
+
+    if (h264_access_unit_stream_append_pending(stream, fragment, fragment_size) != 0) {
+        return -1;
+    }
+
+    return h264_access_unit_stream_process_pending(stream, flush, output, user_data);
+}
+
 /* 追加一个 Access Unit 的缓存副本。 */
 static int demo_append_h264_access_unit(sample_demo_media_t *demo_media,
                                         const uint8_t *access_unit,
@@ -323,92 +767,78 @@ static void demo_free_h264_access_units(sample_demo_media_t *demo_media)
     demo_media->video_nalu_count = 0;
 }
 
-/* 使用对外暴露的 demo API，把 Annex-B 裸流逐个 NALU 喂入并组装成 AU。 */
+static int demo_collect_h264_access_unit(const uint8_t *access_unit,
+                                         size_t access_unit_size,
+                                         void *user_data)
+{
+    h264_access_unit_collect_ctx_t *ctx = (h264_access_unit_collect_ctx_t *) user_data;
+
+    if (ctx == NULL || ctx->demo_media == NULL) {
+        return -1;
+    }
+    if (demo_append_h264_access_unit(ctx->demo_media, access_unit, access_unit_size) != 0) {
+        ctx->failed = 1;
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * 演示：把文件内存按小块喂给 demo_h264_input_stream_fragment()。
+ * 实际板端可保留 h264_access_unit_stream_t 和 demo_h264_input_stream_fragment()，
+ * 每次收到编码器/网络给出的 H264 片段就调用一次；回调出的 AU 直接送
+ * sip_embed_service_push_video_frame()。
+ */
 static int demo_build_h264_access_units(sample_demo_media_t *demo_media,
                                         const unsigned char *video_blob,
                                         size_t video_blob_size)
 {
-    size_t search_offset = 0;
-    mock_h264_au_builder_t builder;
-    const uint8_t *access_unit = NULL;
-    size_t access_unit_size = 0;
-    int flush_rc;
+    h264_access_unit_stream_t stream;
+    h264_access_unit_collect_ctx_t collect_ctx;
+    size_t offset = 0U;
+    enum { DEMO_H264_INPUT_CHUNK_SIZE = 137U };
 
-    memset(&builder, 0, sizeof(builder));
-    mock_h264_au_builder_init(&builder);
+    if (demo_media == NULL || video_blob == NULL || video_blob_size == 0U) {
+        return -1;
+    }
+
+    h264_access_unit_stream_init(&stream);
+    collect_ctx.demo_media = demo_media;
+    collect_ctx.failed = 0;
     demo_media->video_nalu_count = 0;
 
-    while (1) {
-        size_t start_offset;
-        size_t code_size;
-        size_t next_offset;
-        size_t next_code_size;
-        size_t nal_offset;
-        size_t nal_end;
-        int has_next;
+    while (offset < video_blob_size) {
+        size_t remaining = video_blob_size - offset;
+        size_t chunk_size = remaining > DEMO_H264_INPUT_CHUNK_SIZE
+                                ? DEMO_H264_INPUT_CHUNK_SIZE
+                                : remaining;
 
-        if (!find_start_code(video_blob,
-                             video_blob_size,
-                             search_offset,
-                             &start_offset,
-                             &code_size)) {
-            break;
+        if (demo_h264_input_stream_fragment(&stream,
+                                            video_blob + offset,
+                                            chunk_size,
+                                            0,
+                                            demo_collect_h264_access_unit,
+                                            &collect_ctx) != 0) {
+            h264_access_unit_stream_cleanup(&stream);
+            return -1;
         }
-
-        nal_offset = start_offset + code_size;
-        if (nal_offset >= video_blob_size) {
-            break;
-        }
-
-        has_next = find_start_code(video_blob,
-                                   video_blob_size,
-                                   nal_offset,
-                                   &next_offset,
-                                   &next_code_size);
-        nal_end = has_next ? next_offset : video_blob_size;
-        while (nal_end > nal_offset && video_blob[nal_end - 1] == 0x00U) {
-            --nal_end;
-        }
-
-        if (nal_end > start_offset) {
-            int input_rc = mock_h264_input_nalu(&builder,
-                                                video_blob + start_offset,
-                                                nal_end - start_offset,
-                                                &access_unit,
-                                                &access_unit_size);
-
-            if (input_rc < 0) {
-                mock_h264_au_builder_cleanup(&builder);
-                return -1;
-            }
-            ++demo_media->video_nalu_count;
-            if (input_rc > 0 &&
-                demo_append_h264_access_unit(demo_media, access_unit, access_unit_size) != 0) {
-                mock_h264_au_builder_cleanup(&builder);
-                return -1;
-            }
-        }
-
-        if (!has_next) {
-            break;
-        }
-        search_offset = next_offset;
+        offset += chunk_size;
     }
 
-    flush_rc = mock_h264_flush(&builder, &access_unit, &access_unit_size);
-    if (flush_rc < 0) {
-        mock_h264_au_builder_cleanup(&builder);
-        return -1;
-    }
-    if (flush_rc > 0 &&
-        demo_append_h264_access_unit(demo_media, access_unit, access_unit_size) != 0) {
-        mock_h264_au_builder_cleanup(&builder);
+    if (demo_h264_input_stream_fragment(&stream,
+                                        NULL,
+                                        0U,
+                                        1,
+                                        demo_collect_h264_access_unit,
+                                        &collect_ctx) != 0) {
+        h264_access_unit_stream_cleanup(&stream);
         return -1;
     }
 
-    mock_h264_au_builder_cleanup(&builder);
-
-    return demo_media->video_frame_count > 0 ? 0 : -1;
+    demo_media->video_nalu_count = stream.nalu_count;
+    h264_access_unit_stream_cleanup(&stream);
+    return !collect_ctx.failed && demo_media->video_frame_count > 0U ? 0 : -1;
 }
 
 /* 判断一个 Access Unit 内是否包含 IDR，用于拥塞恢复后的重新起播。 */
