@@ -34,14 +34,11 @@ typedef int (*h264_access_unit_output_fn)(const uint8_t *access_unit,
                                           void *user_data);
 
 /*
- * 可移植的 H264 Annex-B 分片转 Access Unit 状态。
- * 板端使用时按实时收到的 H264 码流片段反复调用 demo_h264_input_stream_fragment()，
- * 回调输出的 access_unit 可直接传给 sip_embed_service_push_video_frame()。
+ * 可移植的 H264 NALU 序列转 Access Unit 状态。
+ * 输入要求：每次传入一个边界完整的 NALU（不带 Annex-B 起始码）。
+ * 输出方式：当检测到 AU 边界时，通过回调输出完整 AU（Annex-B 形式）。
  */
 typedef struct {
-    unsigned char *pending_stream;
-    size_t pending_stream_size;
-    size_t pending_stream_capacity;
     unsigned char *current_au;
     size_t current_au_size;
     size_t current_au_capacity;
@@ -440,7 +437,6 @@ static void h264_access_unit_stream_cleanup(h264_access_unit_stream_t *stream)
         return;
     }
 
-    free(stream->pending_stream);
     free(stream->current_au);
     memset(stream, 0, sizeof(*stream));
 }
@@ -483,50 +479,6 @@ static int h264_reserve_buffer(unsigned char **buffer,
     *buffer = grown;
     *capacity = new_capacity;
     return 0;
-}
-
-static int h264_access_unit_stream_append_pending(h264_access_unit_stream_t *stream,
-                                                  const uint8_t *fragment,
-                                                  size_t fragment_size)
-{
-    if (stream == NULL) {
-        return -1;
-    }
-    if (fragment_size == 0U) {
-        return 0;
-    }
-    if (fragment == NULL) {
-        return -1;
-    }
-
-    if (h264_reserve_buffer(&stream->pending_stream,
-                            &stream->pending_stream_capacity,
-                            stream->pending_stream_size,
-                            fragment_size) != 0) {
-        return -1;
-    }
-
-    memcpy(stream->pending_stream + stream->pending_stream_size, fragment, fragment_size);
-    stream->pending_stream_size += fragment_size;
-    return 0;
-}
-
-static void h264_access_unit_stream_discard_pending_prefix(h264_access_unit_stream_t *stream,
-                                                           size_t keep_offset)
-{
-    if (stream == NULL || keep_offset == 0U) {
-        return;
-    }
-
-    if (keep_offset >= stream->pending_stream_size) {
-        stream->pending_stream_size = 0U;
-        return;
-    }
-
-    memmove(stream->pending_stream,
-            stream->pending_stream + keep_offset,
-            stream->pending_stream_size - keep_offset);
-    stream->pending_stream_size -= keep_offset;
 }
 
 static int h264_access_unit_stream_emit_current(h264_access_unit_stream_t *stream,
@@ -623,70 +575,28 @@ static int h264_access_unit_stream_input_nalu(h264_access_unit_stream_t *stream,
     return 0;
 }
 
-static int h264_access_unit_stream_process_pending(h264_access_unit_stream_t *stream,
-                                                   int flush,
-                                                   h264_access_unit_output_fn output,
-                                                   void *user_data)
+/*
+ * 可移植核心：
+ * 顺序输入边界完整的 NALU，按 AU 边界输出 Annex-B AU。
+ * flush=1 且 nalu_size=0 时，输出当前缓存中的最后一个 AU。
+ */
+static int h264_access_unit_stream_push_nalu(h264_access_unit_stream_t *stream,
+                                             const uint8_t *nalu,
+                                             size_t nalu_size,
+                                             int flush,
+                                             h264_access_unit_output_fn output,
+                                             void *user_data)
 {
-    while (stream->pending_stream_size > 0U) {
-        size_t start_offset;
-        size_t code_size;
-        size_t nal_offset;
-        size_t next_offset;
-        size_t next_code_size;
-        size_t nal_end;
-        int has_next;
+    if (stream == NULL || output == NULL) {
+        return -1;
+    }
 
-        if (!find_start_code(stream->pending_stream,
-                             stream->pending_stream_size,
-                             0U,
-                             &start_offset,
-                             &code_size)) {
-            if (stream->pending_stream_size > 3U) {
-                h264_access_unit_stream_discard_pending_prefix(stream,
-                                                               stream->pending_stream_size - 3U);
-            }
-            return 0;
-        }
-
-        if (start_offset > 0U) {
-            h264_access_unit_stream_discard_pending_prefix(stream, start_offset);
-            continue;
-        }
-
-        nal_offset = code_size;
-        if (nal_offset >= stream->pending_stream_size) {
-            return 0;
-        }
-
-        has_next = find_start_code(stream->pending_stream,
-                                   stream->pending_stream_size,
-                                   nal_offset,
-                                   &next_offset,
-                                   &next_code_size);
-        (void) next_code_size;
-        if (!has_next && !flush) {
-            return 0;
-        }
-
-        nal_end = has_next ? next_offset : stream->pending_stream_size;
-        while (nal_end > nal_offset && stream->pending_stream[nal_end - 1U] == 0x00U) {
-            --nal_end;
-        }
-
-        if (nal_end > nal_offset &&
-            h264_access_unit_stream_input_nalu(stream,
-                                               stream->pending_stream + nal_offset,
-                                               nal_end - nal_offset,
-                                               output,
-                                               user_data) != 0) {
+    if (nalu_size > 0U) {
+        if (nalu == NULL) {
             return -1;
         }
-
-        if (has_next) {
-            h264_access_unit_stream_discard_pending_prefix(stream, next_offset);
-        } else {
-            stream->pending_stream_size = 0U;
+        if (h264_access_unit_stream_input_nalu(stream, nalu, nalu_size, output, user_data) != 0) {
+            return -1;
         }
     }
 
@@ -696,25 +606,6 @@ static int h264_access_unit_stream_process_pending(h264_access_unit_stream_t *st
 
     return 0;
 }
-
-static int demo_h264_input_stream_fragment(h264_access_unit_stream_t *stream,
-                                           const uint8_t *fragment,
-                                           size_t fragment_size,
-                                           int flush,
-                                           h264_access_unit_output_fn output,
-                                           void *user_data)
-{
-    if (stream == NULL || output == NULL) {
-        return -1;
-    }
-
-    if (h264_access_unit_stream_append_pending(stream, fragment, fragment_size) != 0) {
-        return -1;
-    }
-
-    return h264_access_unit_stream_process_pending(stream, flush, output, user_data);
-}
-
 /* 追加一个 Access Unit 的缓存副本。 */
 static int demo_append_h264_access_unit(sample_demo_media_t *demo_media,
                                         const uint8_t *access_unit,
@@ -784,10 +675,83 @@ static int demo_collect_h264_access_unit(const uint8_t *access_unit,
     return 0;
 }
 
+/* 演示：从 Annex-B 码流中提取完整 NALU，模拟实时输入的小单元。 */
+static int demo_generate_h264_input_fragments(const unsigned char *video_blob,
+                                              size_t video_blob_size,
+                                              h264_access_unit_stream_t *stream,
+                                              h264_access_unit_collect_ctx_t *collect_ctx)
+{
+    size_t search_offset = 0U;
+
+    if (video_blob == NULL || video_blob_size == 0U || stream == NULL || collect_ctx == NULL) {
+        return -1;
+    }
+
+    while (search_offset < video_blob_size) {
+        size_t start_offset;
+        size_t code_size;
+        size_t nal_offset;
+        size_t next_offset;
+        size_t next_code_size;
+        size_t nal_end;
+        int has_next;
+
+        if (!find_start_code(video_blob,
+                             video_blob_size,
+                             search_offset,
+                             &start_offset,
+                             &code_size)) {
+            break;
+        }
+
+        nal_offset = start_offset + code_size;
+        if (nal_offset >= video_blob_size) {
+            break;
+        }
+
+        has_next = find_start_code(video_blob,
+                                   video_blob_size,
+                                   nal_offset,
+                                   &next_offset,
+                                   &next_code_size);
+        (void) next_code_size;
+
+        nal_end = has_next ? next_offset : video_blob_size;
+        while (nal_end > nal_offset && video_blob[nal_end - 1U] == 0x00U) {
+            --nal_end;
+        }
+
+        if (nal_end > nal_offset &&
+            h264_access_unit_stream_push_nalu(stream,
+                                              video_blob + nal_offset,
+                                              nal_end - nal_offset,
+                                              0,
+                                              demo_collect_h264_access_unit,
+                                              collect_ctx) != 0) {
+            return -1;
+        }
+
+        if (!has_next) {
+            break;
+        }
+        search_offset = next_offset;
+    }
+
+    return h264_access_unit_stream_push_nalu(stream,
+                                             NULL,
+                                             0U,
+                                             1,
+                                             demo_collect_h264_access_unit,
+                                             collect_ctx);
+}
+
 /*
- * 演示：把文件内存按小块喂给 demo_h264_input_stream_fragment()。
- * 实际板端可保留 h264_access_unit_stream_t 和 demo_h264_input_stream_fragment()，
- * 每次收到编码器/网络给出的 H264 片段就调用一次；回调出的 AU 直接送
+ * 演示：
+ * 1. 先把文件内存拆成完整 NALU，模拟实时收到的小单元。
+ * 2. 再把这些 NALU 持续喂给可移植的 AU 组包器，输出完整 Access Unit。
+ * 板端如果已经拿到完整 NALU，可直接移植 h264_access_unit_stream_t、
+ * h264_access_unit_stream_init()、h264_access_unit_stream_push_nalu()、
+ * h264_access_unit_stream_cleanup() 这组实现；回调出的 AU 直接送
  * sip_embed_service_push_video_frame()。
  */
 static int demo_build_h264_access_units(sample_demo_media_t *demo_media,
@@ -796,8 +760,6 @@ static int demo_build_h264_access_units(sample_demo_media_t *demo_media,
 {
     h264_access_unit_stream_t stream;
     h264_access_unit_collect_ctx_t collect_ctx;
-    size_t offset = 0U;
-    enum { DEMO_H264_INPUT_CHUNK_SIZE = 137U };
 
     if (demo_media == NULL || video_blob == NULL || video_blob_size == 0U) {
         return -1;
@@ -808,30 +770,10 @@ static int demo_build_h264_access_units(sample_demo_media_t *demo_media,
     collect_ctx.failed = 0;
     demo_media->video_nalu_count = 0;
 
-    while (offset < video_blob_size) {
-        size_t remaining = video_blob_size - offset;
-        size_t chunk_size = remaining > DEMO_H264_INPUT_CHUNK_SIZE
-                                ? DEMO_H264_INPUT_CHUNK_SIZE
-                                : remaining;
-
-        if (demo_h264_input_stream_fragment(&stream,
-                                            video_blob + offset,
-                                            chunk_size,
-                                            0,
-                                            demo_collect_h264_access_unit,
-                                            &collect_ctx) != 0) {
-            h264_access_unit_stream_cleanup(&stream);
-            return -1;
-        }
-        offset += chunk_size;
-    }
-
-    if (demo_h264_input_stream_fragment(&stream,
-                                        NULL,
-                                        0U,
-                                        1,
-                                        demo_collect_h264_access_unit,
-                                        &collect_ctx) != 0) {
+    if (demo_generate_h264_input_fragments(video_blob,
+                                           video_blob_size,
+                                           &stream,
+                                           &collect_ctx) != 0) {
         h264_access_unit_stream_cleanup(&stream);
         return -1;
     }
