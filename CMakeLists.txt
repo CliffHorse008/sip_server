@@ -41,6 +41,7 @@ add_library(sipserver STATIC
 )
 
 add_executable(sipserver_upper_push_demo
+    example/h264_access_unit_stream.c
     example/upper_push_demo.c
 )
 
@@ -48,7 +49,7 @@ target_include_directories(sipserver
     PUBLIC include
     PRIVATE src src/internal
 )
-target_include_directories(sipserver_upper_push_demo PRIVATE include)
+target_include_directories(sipserver_upper_push_demo PRIVATE include example)
 
 target_enable_strict_warnings(sipserver)
 target_enable_strict_warnings(sipserver_upper_push_demo)
