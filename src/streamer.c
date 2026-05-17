@@ -115,6 +115,19 @@ static uint32_t monotonic_time_ms32(void)
     return (uint32_t) ((uint64_t) tv.tv_sec * 1000ULL + (uint64_t) tv.tv_usec / 1000ULL);
 }
 
+static void realtime_deadline_after_ms(struct timespec *ts, int wait_ms)
+{
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+    ts->tv_sec = tv.tv_sec + (time_t) (wait_ms / 1000);
+    ts->tv_nsec = (long) tv.tv_usec * 1000L + (long) (wait_ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
 static int string_case_prefix(const char *text, const char *prefix)
 {
     while (*prefix != '\0') {
@@ -575,13 +588,7 @@ static int media_queue_pop(media_frame_queue_t *queue, media_frame_t *frame, int
 
         {
             struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += wait_ms / 1000;
-            ts.tv_nsec += (long) (wait_ms % 1000) * 1000000L;
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec += 1;
-                ts.tv_nsec -= 1000000000L;
-            }
+            realtime_deadline_after_ms(&ts, wait_ms);
             rc = pthread_cond_timedwait(&queue->cond, &queue->mutex, &ts);
         }
 
