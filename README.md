@@ -138,6 +138,8 @@ build/libsipserver.a
 ## 运行
 
 如果 SIP 客户端和本机不在同一台机器，`--media-ip` 必须设置为客户端可达的本机 IP。
+如果系统启动时网卡初始化较晚，也可以不依赖固定的 `--media-ip`，而是在业务侧通过
+`config_set_media_ip_provider()` 注册一个运行期回调，由库在发送 SIP `Contact` 和生成 SDP 时动态取值。
 和 Linphone 联调时，当前更建议使用 `--audio-codec g711a`。
 
 AAC 模式（UDP SIP）：
@@ -296,6 +298,20 @@ sip_embed_service_t *service = sip_embed_service_create(&config);
 sample_host_init(&host, &config, service);
 
 return sip_embed_service_run(service);
+```
+
+如果你的对外媒体 IP 需要在运行期动态决定，可以在创建服务前注册：
+
+```c
+static const char *resolve_media_ip(void *user_data)
+{
+    sample_host_t *host = (sample_host_t *) user_data;
+    (void) host;
+    return "192.168.1.10";
+}
+
+config_set_media_ip_provider(&config.app, resolve_media_ip, &host);
+service = sip_embed_service_create(&config.app);
 ```
 
 如果你自己接入上层实时音视频线程，送帧接口就是：

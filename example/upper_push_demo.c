@@ -870,6 +870,7 @@ int main(int argc, char **argv)
     sample_host_t host;
     sip_embed_service_t *service;
     sip_embed_callbacks_t callbacks;
+    const char *media_ip;
     int parse_rc;
     int run_rc;
 
@@ -907,13 +908,14 @@ int main(int argc, char **argv)
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+    media_ip = config_get_media_ip(&config.app);
 
     fprintf(stdout,
             "sipserver starting on %s:%u/%s, media=%s, rtp_transport=%s, audio_codec=%s, mode=upper-push-demo\n",
             config.app.bind_ip,
             config.app.sip_port,
             config_sip_transport_name(config.app.sip_transport),
-            config.app.media_ip,
+            media_ip,
             config_rtp_transport_name(config.app.rtp_transport),
             config_audio_codec_name(config.app.audio_codec));
 

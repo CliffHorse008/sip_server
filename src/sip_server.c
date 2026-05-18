@@ -559,11 +559,13 @@ static int send_response(int sock,
     char to_header[1100];
     char via_header[1100];
     char contact_transport[32];
+    const char *media_ip;
     size_t body_length = body == NULL ? 0U : strlen(body);
     int written;
 
     build_to_header(request->to, local_tag, to_header, sizeof(to_header));
     build_via_header(request, config->sip_transport, via_header, sizeof(via_header));
+    media_ip = config_get_media_ip(config);
     snprintf(contact_transport,
              sizeof(contact_transport),
              "%s",
@@ -592,7 +594,7 @@ static int send_response(int sock,
                        request->call_id,
                        request->cseq,
                        request->cseq_method[0] == '\0' ? request->method : request->cseq_method,
-                       config->media_ip,
+                       media_ip,
                        config->sip_port,
                        contact_transport,
                        body != NULL ? "Content-Type: application/sdp\r\n" : "",

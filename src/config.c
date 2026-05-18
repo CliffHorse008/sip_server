@@ -60,6 +60,34 @@ void config_set_defaults(app_config_t *config)
     config->audio_codec = AUDIO_CODEC_AAC;
 }
 
+void config_set_media_ip_provider(app_config_t *config, media_ip_provider_t provider, void *user_data)
+{
+    if (config == NULL) {
+        return;
+    }
+
+    config->media_ip_provider = provider;
+    config->media_ip_provider_user_data = user_data;
+}
+
+const char *config_get_media_ip(const app_config_t *config)
+{
+    const char *media_ip;
+
+    if (config == NULL) {
+        return "";
+    }
+
+    if (config->media_ip_provider != NULL) {
+        media_ip = config->media_ip_provider(config->media_ip_provider_user_data);
+        if (media_ip != NULL && media_ip[0] != '\0') {
+            return media_ip;
+        }
+    }
+
+    return config->media_ip;
+}
+
 const char *config_audio_codec_name(audio_codec_t codec)
 {
     return codec == AUDIO_CODEC_G711A ? "g711a" : "aac";

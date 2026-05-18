@@ -1416,12 +1416,15 @@ int streamer_build_sdp(const streamer_t *streamer,
                        char *buffer,
                        size_t buffer_size)
 {
+    const char *media_ip;
     int written = 0;
     size_t index;
 
     if (plan == NULL) {
         return -1;
     }
+
+    media_ip = config_get_media_ip(streamer->config);
 
     written += snprintf(buffer + written,
                         buffer_size > (size_t) written ? buffer_size - (size_t) written : 0,
@@ -1430,8 +1433,8 @@ int streamer_build_sdp(const streamer_t *streamer,
                         "s=Minimal SIP Server\r\n"
                         "c=IN IP4 %s\r\n"
                         "t=0 0\r\n",
-                        streamer->config->media_ip,
-                        streamer->config->media_ip);
+                        media_ip,
+                        media_ip);
 
     for (index = 0; index < plan->media_count; ++index) {
         const streamer_sdp_media_t *media = &plan->media[index];
