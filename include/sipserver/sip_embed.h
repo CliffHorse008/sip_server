@@ -25,6 +25,10 @@ void sip_embed_service_stop(sip_embed_service_t *service);
 int sip_embed_service_stop_requested(sip_embed_service_t *service);
 /* 运行 SIP 会话层。 */
 int sip_embed_service_run(sip_embed_service_t *service);
+/* 使用库内默认策略为 INVITE 生成应答。 */
+int sip_embed_service_build_answer(sip_embed_service_t *service,
+                                   const sip_invite_event_t *event,
+                                   sip_invite_response_t *response);
 /* 读取当前会话状态与代数，便于宿主同步推流状态。 */
 void sip_embed_service_get_stream_state(sip_embed_service_t *service, int *stream_active, unsigned int *generation);
 /* 查询当前音频发送侧是否存在较高的 KCP 待发积压。 */

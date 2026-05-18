@@ -28,6 +28,10 @@ void sip_session_service_stop(sip_session_service_t *service);
 int sip_session_service_stop_requested(sip_session_service_t *service);
 /* 运行 SIP 会话服务。 */
 int sip_session_service_run(sip_session_service_t *service);
+/* 使用库内默认策略为 INVITE 生成应答。 */
+int sip_session_service_build_answer(sip_session_service_t *service,
+                                     const sip_invite_event_t *event,
+                                     sip_invite_response_t *response);
 /* 获取当前活动会话对应的 streamer 及其代数。 */
 streamer_t *sip_session_service_get_stream(sip_session_service_t *service, unsigned int *generation);
 /* 读取当前会话状态与代数。 */

@@ -141,6 +141,17 @@ int sip_embed_service_run(sip_embed_service_t *service)
     return sip_session_service_run(service->session);
 }
 
+int sip_embed_service_build_answer(sip_embed_service_t *service,
+                                   const sip_invite_event_t *event,
+                                   sip_invite_response_t *response)
+{
+    if (service == NULL) {
+        return -1;
+    }
+
+    return sip_session_service_build_answer(service->session, event, response);
+}
+
 void sip_embed_service_get_stream_state(sip_embed_service_t *service, int *stream_active, unsigned int *generation)
 {
     if (service == NULL) {

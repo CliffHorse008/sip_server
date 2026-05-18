@@ -62,9 +62,9 @@ static void sip_session_service_set_stream(sip_session_service_t *service, strea
     pthread_mutex_unlock(&service->mutex);
 }
 
-static int sip_session_service_build_answer(sip_session_service_t *service,
-                                            const sip_invite_event_t *event,
-                                            sip_invite_response_t *response)
+int sip_session_service_build_answer(sip_session_service_t *service,
+                                     const sip_invite_event_t *event,
+                                     sip_invite_response_t *response)
 {
     const app_config_t *config = service->config;
     streamer_sdp_plan_t plan;
