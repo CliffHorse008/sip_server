@@ -21,6 +21,8 @@ void sip_embed_service_destroy(sip_embed_service_t *service);
 void sip_embed_service_set_callbacks(sip_embed_service_t *service, const sip_embed_callbacks_t *callbacks);
 /* 请求嵌入式服务停止。 */
 void sip_embed_service_stop(sip_embed_service_t *service);
+/* 请求终止当前活动 dialog，但不停止整个 SIP 服务。 */
+void sip_embed_service_stop_current_dialog(sip_embed_service_t *service);
 /* 查询嵌入式服务是否已收到停止请求。 */
 int sip_embed_service_stop_requested(sip_embed_service_t *service);
 /* 运行 SIP 会话层。 */

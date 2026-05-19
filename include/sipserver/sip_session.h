@@ -24,6 +24,8 @@ void sip_session_service_destroy(sip_session_service_t *service);
 void sip_session_service_set_callbacks(sip_session_service_t *service, const sip_session_callbacks_t *callbacks);
 /* 请求 SIP 会话服务停止。 */
 void sip_session_service_stop(sip_session_service_t *service);
+/* 请求终止当前活动 dialog，但不停止整个 SIP 服务。 */
+void sip_session_service_stop_current_dialog(sip_session_service_t *service);
 /* 查询 SIP 会话服务是否已收到停止请求。 */
 int sip_session_service_stop_requested(sip_session_service_t *service);
 /* 运行 SIP 会话服务。 */

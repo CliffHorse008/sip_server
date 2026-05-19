@@ -123,6 +123,15 @@ void sip_embed_service_stop(sip_embed_service_t *service)
     sip_session_service_stop(service->session);
 }
 
+void sip_embed_service_stop_current_dialog(sip_embed_service_t *service)
+{
+    if (service == NULL) {
+        return;
+    }
+
+    sip_session_service_stop_current_dialog(service->session);
+}
+
 int sip_embed_service_stop_requested(sip_embed_service_t *service)
 {
     if (service == NULL) {

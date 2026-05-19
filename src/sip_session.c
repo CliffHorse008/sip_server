@@ -12,6 +12,7 @@ struct sip_session_service {
     streamer_t *streamer;
     unsigned int stream_generation;
     volatile int stop_requested;
+    volatile int terminate_dialog_requested;
     sip_session_callbacks_t callbacks;
 };
 
@@ -270,6 +271,15 @@ void sip_session_service_stop(sip_session_service_t *service)
     service->stop_requested = 1;
 }
 
+void sip_session_service_stop_current_dialog(sip_session_service_t *service)
+{
+    if (service == NULL) {
+        return;
+    }
+
+    service->terminate_dialog_requested = 1;
+}
+
 int sip_session_service_stop_requested(sip_session_service_t *service)
 {
     if (service == NULL) {
@@ -282,19 +292,24 @@ int sip_session_service_stop_requested(sip_session_service_t *service)
 int sip_session_service_run(sip_session_service_t *service)
 {
     sip_server_handlers_t handlers;
+    sip_server_run_flags_t flags;
 
     if (service == NULL) {
         return -1;
     }
 
     service->stop_requested = 0;
+    service->terminate_dialog_requested = 0;
     memset(&handlers, 0, sizeof(handlers));
+    memset(&flags, 0, sizeof(flags));
     handlers.on_signal = sip_session_on_signal;
     handlers.on_invite = sip_session_on_invite;
     handlers.on_media = sip_session_on_media;
     handlers.user_data = service;
+    flags.stop_requested = &service->stop_requested;
+    flags.terminate_dialog_requested = &service->terminate_dialog_requested;
 
-    return sip_server_run_with_handlers(service->config, &service->stop_requested, &handlers);
+    return sip_server_run_with_handlers_ex(service->config, &flags, &handlers);
 }
 
 streamer_t *sip_session_service_get_stream(sip_session_service_t *service, unsigned int *generation)

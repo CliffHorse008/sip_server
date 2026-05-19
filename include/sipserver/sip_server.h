@@ -109,6 +109,12 @@ typedef struct {
     void *user_data;
 } sip_server_handlers_t;
 
+/* 可选运行时控制位。 */
+typedef struct {
+    const volatile int *stop_requested;
+    volatile int *terminate_dialog_requested;
+} sip_server_run_flags_t;
+
 /* 使用默认行为运行 SIP 服务。 */
 int sip_server_run(const app_config_t *config, const volatile int *stop_requested);
 /* 使用自定义媒体回调运行 SIP 服务。 */
@@ -120,5 +126,9 @@ int sip_server_run_with_callback(const app_config_t *config,
 int sip_server_run_with_handlers(const app_config_t *config,
                                  const volatile int *stop_requested,
                                  const sip_server_handlers_t *handlers);
+/* 使用完整回调集合和扩展控制位运行 SIP 服务。 */
+int sip_server_run_with_handlers_ex(const app_config_t *config,
+                                    const sip_server_run_flags_t *flags,
+                                    const sip_server_handlers_t *handlers);
 
 #endif

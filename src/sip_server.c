@@ -2546,11 +2546,31 @@ int sip_server_run_with_handlers(const app_config_t *config,
                                  const volatile int *stop_requested,
                                  const sip_server_handlers_t *handlers)
 {
+    sip_server_run_flags_t flags;
+
+    memset(&flags, 0, sizeof(flags));
+    flags.stop_requested = stop_requested;
+    return sip_server_run_with_handlers_ex(config, &flags, handlers);
+}
+
+int sip_server_run_with_handlers_ex(const app_config_t *config,
+                                    const sip_server_run_flags_t *flags,
+                                    const sip_server_handlers_t *handlers)
+{
     int sip_socket;
     streamer_t *streamer;
     sip_dialog_t dialog;
     terminated_dialog_t terminated_dialogs[SIP_MAX_TERMINATED_DIALOGS];
     invite_transaction_t invite_transactions[SIP_MAX_INVITE_TRANSACTIONS];
+    const volatile int *stop_requested;
+    volatile int *terminate_dialog_requested;
+
+    if (flags == NULL || flags->stop_requested == NULL) {
+        return -1;
+    }
+
+    stop_requested = flags->stop_requested;
+    terminate_dialog_requested = flags->terminate_dialog_requested;
 
     streamer = streamer_create(config);
     if (streamer == NULL) {
@@ -2606,6 +2626,15 @@ int sip_server_run_with_handlers(const app_config_t *config,
                                         NULL,
                                         "session timer expired");
             }
+            if (terminate_dialog_requested != NULL && *terminate_dialog_requested != 0) {
+                terminate_active_dialog(streamer,
+                                        &dialog,
+                                        terminated_dialogs,
+                                        handlers,
+                                        NULL,
+                                        "host requested dialog stop");
+                *terminate_dialog_requested = 0;
+            }
 
             received = recvfrom(sip_socket,
                                 buffer,
@@ -2655,6 +2684,15 @@ int sip_server_run_with_handlers(const app_config_t *config,
                                         handlers,
                                         NULL,
                                         "session timer expired");
+            }
+            if (terminate_dialog_requested != NULL && *terminate_dialog_requested != 0) {
+                terminate_active_dialog(streamer,
+                                        &dialog,
+                                        terminated_dialogs,
+                                        handlers,
+                                        NULL,
+                                        "host requested dialog stop");
+                *terminate_dialog_requested = 0;
             }
 
             FD_ZERO(&read_fds);
